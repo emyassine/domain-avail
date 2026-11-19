@@ -68,12 +68,12 @@ declare -- CACHE_DIR="${DOMAIN_AVAIL_CACHE_DIR:-${XDG_CACHE_HOME:-${HOME:-${TMPD
 declare -- DELAY="0.5"                      # decimal string (seconds)
 declare -- TIMEOUT_BIN=""
 declare -- WORK=""
-declare -i TIMEOUT=15 RETRIES=2 JOBS=4
+declare -i TIMEOUT=15 RETRIES=2 JOBS=0 JOBS_SET=0 CPU_COUNT=0 RAM_AVAILABLE_MB=0 SWAP_FREE_MB=0
 declare -i TTL=604800 TTL_AVAILABLE=3600
 declare -i COUNT=20 AGENT_TIMEOUT=120
 declare -i VERBOSITY=1                      # 0 quiet · 1 normal · 2 verbose · 3 debug
 declare -i REFRESH=0 NO_CACHE=0 NO_HEADER=0 NO_CHECK=0 NO_SAVE=0
-declare -i SHOW_ALL=0 ONLY_SET=0 EXIT_STATUS=0 PRINT_PROMPT=0 SINGLE_WORD=0 AGENT_EVAL=0
+declare -i SHOW_ALL=0 ONLY_SET=0 EXIT_STATUS=0 PRINT_PROMPT=0 SINGLE_WORD=0 AGENT_EVAL=0 WITH_MEANING=1
 declare -i TOTAL=0 N_AVAIL=0 N_TAKEN=0 N_UNKNOWN=0
 declare -i OUT_TTY=0 ERR_TTY=0 IN_TTY=0
 [[ -t 1 ]] && OUT_TTY=1
@@ -81,7 +81,7 @@ declare -i OUT_TTY=0 ERR_TTY=0 IN_TTY=0
 [[ -t 0 ]] && IN_TTY=1
 
 declare -a POSITIONAL=() TOKENS=() DOMAINS=() TLD_ARRAY=() MANDATORY_TLD_ARRAY=() ROWS_ALL=() ROWS=() KEYWORDS=() CANDIDATES=() HISTORY_OLD_CANDIDATES=() HISTORY_THIS_CANDIDATES=()
-declare -A SGR_OUT=() SGR_ERR=() HISTORY_RECORD=() HISTORY_NAME_SEEN=()
+declare -A SGR_OUT=() SGR_ERR=() HISTORY_RECORD=() HISTORY_NAME_SEEN=() CANDIDATE_MEANING=()
 declare -A TLD_CHAIN=()                     # root TLD -> "rdap:URL whois:HOST dns"
 declare -A RDAP_SERVER=() WHOIS_SERVER=()   # user overrides (root TLD -> value)
 declare -A DELAY_TLD=([ma]="1.2")           # per-TLD politeness delays (overridable)
@@ -196,6 +196,12 @@ display_width() {
   LC_ALL=$LC_ALL awk '{print length($0)}' <<< "$1"
 }
 
+truncate_display() {
+  local LC_ALL=${LANG:-C.UTF-8}
+  [[ $LC_ALL == C ]] && LC_ALL=C.UTF-8
+  LC_ALL=$LC_ALL awk -v w="$2" 'length($0) > w ? substr($0, 1, w - 3) "..." : $0' <<< "$1"
+}
+
 trunc() { # trunc text width -> REPLY
   local t=$1 w=$2
   if ((${#t} > w && w > 3)); then REPLY="${t:0:w-3}..."; else REPLY=$t; fi
@@ -269,7 +275,7 @@ ${b}${c}OUTPUT${r}
 
 ${b}${c}ENGINE${r}
   ${g}    --method M${r}         auto | rdap | whois | dns  (auto = fallback chain)
-  ${g}-j, --jobs N${r}           parallel checks (default ${JOBS}; per-TLD delays are not enforced across jobs)
+  ${g}-j, --jobs N${r}           parallel checks (default auto: CPU cores + 4, capped at 16)
   ${g}    --delay SEC${r}        politeness delay after each network check (default ${DELAY})
   ${g}    --delay-tld T=SEC${r}  per-TLD delay (repeatable), e.g. --delay-tld ma=2
   ${g}    --timeout SEC${r}      network timeout (default ${TIMEOUT})
@@ -281,6 +287,7 @@ ${b}${c}ENGINE${r}
 
 ${b}${c}SUGGEST${r}
   By default, suggest generates names and checks their availability.
+  It also gives a short proposed brand meaning; use --no-meaning to hide it.
   It prints the exact agent prompt before calling the agent. --no-check prints names only.
   An explicit TLD list is required (e.g. --tld=com,ma).
   ${g}    --agent NAME${r}       auto | none | claude | codex | opencode | grok | gemini   (default: auto)
@@ -292,6 +299,7 @@ ${b}${c}SUGGEST${r}
   ${g}    --context TEXT${r}     describe project/industry (alias: --industry)
   ${g}    --prompt-extra TEXT${r} add a custom instruction to the agent prompt
   ${g}    --agent-eval${r}       ask the same agent to review and improve its candidate list
+  ${g}    --no-meaning${r}       omit the proposed brand meaning column
   The current directory's .domain-avail.history is used by default; --no-history disables it.
   ${g}    --history-scope S${r}  request (default) or industry for name de-duplication scope
   ${g}    --all${r}              show all result rows (suggest already shows all TLD statuses)
@@ -359,7 +367,7 @@ parse_args() {
       --whois-server) need_arg "$@"; parse_kv "$2"; WHOIS_SERVER[$KV_K]=$KV_V; shift 2 ;;
       --timeout)      need_arg "$@"; is_posint "$2" || die "--timeout must be a positive integer"; TIMEOUT=$2; shift 2 ;;
       --retries)      need_arg "$@"; is_uint "$2" || die "--retries must be an integer >= 0"; RETRIES=$2; shift 2 ;;
-      -j|--jobs)      need_arg "$@"; is_posint "$2" || die "--jobs must be a positive integer"; JOBS=$2; shift 2 ;;
+      -j|--jobs)      need_arg "$@"; is_posint "$2" || die "--jobs must be a positive integer"; JOBS=$2; JOBS_SET=1; shift 2 ;;
       --ttl)          need_arg "$@"; is_uint "$2" || die "--ttl must be an integer"; TTL=$2; shift 2 ;;
       -n|--count)     need_arg "$@"; is_posint "$2" || die "--count must be a positive integer"; COUNT=$2; shift 2 ;;
       --agent)        need_arg "$@"; AGENT=$2; shift 2 ;;
@@ -371,6 +379,7 @@ parse_args() {
       --context|--industry) need_arg "$@"; CONTEXT_TEXT=$2; shift 2 ;;
       --prompt-extra) need_arg "$@"; PROMPT_EXTRA=$2; shift 2 ;;
       --agent-eval|--with-agent-eval) AGENT_EVAL=1; shift ;;
+      --no-meaning) WITH_MEANING=0; shift ;;
       --history) HISTORY_FILE="$PWD/.domain-avail.history"; shift ;;
       --no-history) HISTORY_FILE=""; shift ;;
       --history-scope) need_arg "$@"; HISTORY_SCOPE=${2,,}; shift 2 ;;
@@ -625,14 +634,14 @@ history_prepare_key() {
   history_normalize_text "$PROMPT_EXTRA"; extra=$REPLY
   REQUEST_KEY=$(jq -cn --arg keywords "$keywords" --arg industry "$industry" \
     --arg extra "$extra" --arg style "$STYLE" --arg lang "$LANG_HINT" \
-    --argjson single_word "$SINGLE_WORD" '
+    --argjson single_word "$SINGLE_WORD" --argjson with_meaning "$WITH_MEANING" '
       def tokens: split(" ") | map(select(length > 0)) | unique;
       {keywords:($keywords|tokens), industry:($industry|tokens), style:$style,
-       language:$lang, extra:$extra, single_word:($single_word == 1)}')
+       language:$lang, extra:$extra, single_word:($single_word == 1), with_meaning:($with_meaning == 1)}')
   INDUSTRY_KEY=$(jq -cn --arg industry "$industry" --arg style "$STYLE" \
-    --arg lang "$LANG_HINT" --argjson single_word "$SINGLE_WORD" '
+    --arg lang "$LANG_HINT" --argjson single_word "$SINGLE_WORD" --argjson with_meaning "$WITH_MEANING" '
       def tokens: split(" ") | map(select(length > 0)) | unique;
-      {industry:($industry|tokens), style:$style, language:$lang, single_word:($single_word == 1)}')
+      {industry:($industry|tokens), style:$style, language:$lang, single_word:($single_word == 1), with_meaning:($with_meaning == 1)}')
 }
 
 history_load() {
@@ -670,22 +679,27 @@ history_get() { # domain -> REPLY internal result row
 }
 
 history_save_request() {
-  local candidates_json tlds_json mandatory_tlds_json
+  local candidates_json candidate_details_json tlds_json mandatory_tlds_json c
   [[ -n $HISTORY_FILE ]] || return 0
   candidates_json=$(printf '%s\n' "${HISTORY_THIS_CANDIDATES[@]}" | jq -Rsc 'split("\n") | map(select(length > 0))')
+  candidate_details_json=$(
+    for c in "${HISTORY_THIS_CANDIDATES[@]}"; do printf '%s\t%s\n' "$c" "${CANDIDATE_MEANING[$c]:-}"; done \
+      | jq -Rsc --arg sep $'\t' 'split("\n") | map(select(length > 0) | split($sep) as $r | {name:$r[0],meaning:($r[1] // "")})'
+  )
   tlds_json=$(printf '%s\n' "${TLD_ARRAY[@]}" | jq -Rsc 'split("\n") | map(select(length > 0))')
   mandatory_tlds_json=$(printf '%s\n' "${MANDATORY_TLD_ARRAY[@]}" | jq -Rsc 'split("\n") | map(select(length > 0))')
   jq -cn --arg key "$REQUEST_KEY" --arg industry_key "$INDUSTRY_KEY" --arg requested_at "$(now_utc)" \
     --arg keywords "${KEYWORDS[*]}" --arg industry "$CONTEXT_TEXT" --arg style "$STYLE" \
     --arg language "$LANG_HINT" --arg extra "$PROMPT_EXTRA" --argjson single_word "$SINGLE_WORD" \
+    --argjson with_meaning "$WITH_MEANING" \
     --argjson no_check "$NO_CHECK" --argjson count "$COUNT" --arg agent "${agent:-local}" \
     --argjson agent_eval "$AGENT_EVAL" --argjson tlds "$tlds_json" \
     --argjson mandatory_tlds "$mandatory_tlds_json" --arg candidates_scope "$HISTORY_SCOPE" \
-    --argjson candidates "$candidates_json" \
+    --argjson candidates "$candidates_json" --argjson candidate_details "$candidate_details_json" \
     '{type:"request",key:$key,requested_at:$requested_at,availability_check_requested:($no_check == 0),keywords:$keywords,industry:$industry,
-      style:$style,language:$language,prompt_extra:$extra,single_word:($single_word == 1),
+      style:$style,language:$language,prompt_extra:$extra,single_word:($single_word == 1),with_meaning:($with_meaning == 1),
       industry_key:$industry_key,history_scope:$candidates_scope,requested_count:$count,agent:$agent,
-      agent_eval:$agent_eval,tlds:$tlds,mandatory_tlds:$mandatory_tlds,candidates:$candidates}' \
+      agent_eval:$agent_eval,tlds:$tlds,mandatory_tlds:$mandatory_tlds,candidates:$candidates,candidate_details:$candidate_details}' \
     >> "$HISTORY_FILE" || log_warn "cannot write history: $HISTORY_FILE"
 }
 
@@ -958,6 +972,7 @@ run_pipeline() {
   done
   count_rows
   log_time "IANA data ${data_elapsed}s; server discovery ${backend_elapsed}s; checks $((SECONDS - checks_start))s with $JOBS parallel jobs; total $((SECONDS - total_start))s"
+  log_resource_report
 }
 
 row_status() { local _a _b _c; IFS=$SEP read -r _a _b _c REPLY _ <<< "$1"; }
@@ -1118,14 +1133,21 @@ render_table() {
 }
 
 render_suggest_matrix() {
-  local row d n t st me cr ex rg de ca ck duration key name i border hist_count=0
+  local row d n t st me cr ex rg de ca ck duration key name i border hist_count=0 meaning
   local -a names=()
-  local -A seen=() values=() widths=()
-  local -i name_width=4 w
+  local -A seen=() values=() widths=() descriptions=()
+  local -i name_width=4 meaning_width=7 w
   for t in "${TLD_ARRAY[@]}"; do widths[$t]=$((${#t} + 1)); done
   for row in "${ROWS[@]}"; do
     IFS=$SEP read -r d n t st me cr ex rg de ca ck duration <<< "$row"
     if [[ -z ${seen[$n]+x} ]]; then seen[$n]=1; names+=("$n"); fi
+    if ((WITH_MEANING)); then
+      meaning=${CANDIDATE_MEANING[$n]:--}
+      descriptions[$n]=$meaning
+      display_width "$meaning"
+      ((REPLY > 48)) && REPLY=48
+      ((REPLY > meaning_width)) && meaning_width=$REPLY
+    fi
     key="$n$SEP$t"
     values[$key]="$st (${duration}s)"
     if ((ck == 2)); then values[$key]+='*'; hist_count+=1; fi
@@ -1135,11 +1157,13 @@ render_suggest_matrix() {
   done
   border='+'
   hline $((name_width + 2)); border+="$REPLY+"
+  if ((WITH_MEANING)); then hline $((meaning_width + 2)); border+="$REPLY+"; fi
   for t in "${TLD_ARRAY[@]}"; do
     w=${widths[$t]}
     hline $((w + 2)); border+="$REPLY+"
   done
   paint OUT dim "$border"; printf '\n| '; cell NAME "$name_width" bold
+  if ((WITH_MEANING)); then printf ' | '; cell MEANING "$meaning_width" bold; fi
   for t in "${TLD_ARRAY[@]}"; do
     w=${widths[$t]}
     printf ' | '; cell ".$t" "$w" bold
@@ -1147,6 +1171,10 @@ render_suggest_matrix() {
   printf ' |\n'; paint OUT dim "$border"; printf '\n'
   for name in "${names[@]}"; do
     printf '| '; cell "$name" "$name_width"
+    if ((WITH_MEANING)); then
+      meaning=$(truncate_display "${descriptions[$name]:--}" "$meaning_width")
+      printf ' | '; cell "$meaning" "$meaning_width" dim
+    fi
     for t in "${TLD_ARRAY[@]}"; do
       w=${widths[$t]}; key="$name$SEP$t"
       printf ' | '; cell "${values[$key]:--}" "$w"
@@ -1236,8 +1264,10 @@ slugify() {
 }
 
 add_candidate() {
-  local LC_ALL=C c=${1:-}
+  local LC_ALL=C c=${1:-} meaning=${2:-}
   [[ -n $c ]] || return 0
+  meaning=${meaning//$'\t'/ }; meaning=${meaning//$'\r'/ }; meaning=${meaning//$'\n'/ }
+  meaning=$(trim "$meaning")
   [[ $c =~ ^[a-z0-9]+$ ]] || return 0
   ((${#CANDIDATES[@]} >= COUNT)) && return 0
   ((${#c} >= 2 && ${#c} <= 63)) || return 0
@@ -1246,6 +1276,7 @@ add_candidate() {
   [[ -n ${HISTORY_NAME_SEEN[$c]+x} ]] && return 0
   CAND_SEEN[$c]=1
   CANDIDATES+=("$c")
+  CANDIDATE_MEANING[$c]=$meaning
 }
 
 suggest_local() {
@@ -1287,7 +1318,12 @@ suggest_local() {
 }
 
 agent_prompt() {
-  local kw="${KEYWORDS[*]}"
+  local kw="${KEYWORDS[*]}" output_rule
+  if ((WITH_MEANING)); then
+    output_rule='one per line as name | short proposed brand meaning'
+  else
+    output_rule='one name per line'
+  fi
   cat <<EOF
 You are a naming expert. Suggest ${COUNT} domain-friendly brand names for this project.
 Core keyword(s) to preserve or evoke: ${kw}
@@ -1299,10 +1335,13 @@ ${PROMPT_EXTRA:+Additional instruction from the user: ${PROMPT_EXTRA}
 }
 
 Rules:
-- Output ONLY the names, one per line. No numbering, no bullets, no explanations, no TLD.
+- Output ONLY $output_rule. No numbering, no bullets, no TLD.
 - Lowercase ASCII letters and digits only; no accents, hyphens, or other punctuation; 3 to 15 characters.
 - Avoid existing well-known brands and trademarks.
 EOF
+  if ((WITH_MEANING)); then
+    printf '%s\n' '- For each name, give a brief proposed brand meaning (up to 8 words), not an unsupported factual etymology.'
+  fi
   if ((${#HISTORY_OLD_CANDIDATES[@]} > 0)); then
     local IFS=', '
     printf 'Names already requested in the selected history scope; do not repeat: %s\n' "${HISTORY_OLD_CANDIDATES[*]}"
@@ -1319,8 +1358,13 @@ EOF
 }
 
 agent_eval_prompt() {
-  local candidate_list=$1 single_word_constraint=''
+  local candidate_list=$1 single_word_constraint='' output_rule
   ((SINGLE_WORD)) && single_word_constraint='Every result must be one coined word: no spaces, hyphens, or joining recognizable words.'
+  if ((WITH_MEANING)); then
+    output_rule='Return exactly the requested number of lines in name | proposed meaning format.'
+  else
+    output_rule='Return exactly the requested number of names, one per line.'
+  fi
   cat <<EOF
 You are a demanding brand naming director. Review and improve the candidate list below.
 Core keyword(s): ${KEYWORDS[*]}
@@ -1332,11 +1376,14 @@ ${PROMPT_EXTRA:+Additional instruction from the user: ${PROMPT_EXTRA}
 Keep only names that fit the industry and sound distinctive, credible, memorable, and easy to pronounce. Reject generic names, weak suffix variations, clichés, names that merely repeat the core keyword, and names that do not fit the requested language or culture.
 ${single_word_constraint:+${single_word_constraint}
 }
-Return exactly ${COUNT} final names, one per line, names only. Keep the strongest candidates and create better replacements for rejected ones. Do not explain your choices and do not include TLDs.
+${output_rule} Keep the strongest candidates and create better replacements for rejected ones. Do not include TLDs.
 
 Candidates to review:
 ${candidate_list}
 EOF
+  if ((WITH_MEANING)); then
+    printf '%s\n' 'For each name, give a brief proposed brand meaning (up to 8 words), not an unsupported factual etymology.'
+  fi
 }
 
 detect_agent() { # -> REPLY (agent name or empty)
@@ -1370,11 +1417,14 @@ run_agent() { # agent prompt -> stdout
 }
 
 parse_agent_names() { # stdin: agent output -> CANDIDATES
-  local LC_ALL=C line
-  local re='^[[:space:]]*([-*+0-9.)]+[[:space:]]+)?[`"*_]*([a-z0-9][a-z0-9-]*[a-z0-9]|[a-z0-9])(\.[a-z0-9.-]+)?[`"*_]*[[:space:]]*(([-:(]|[[:space:]]-).*)?$'
+  local LC_ALL=C line meaning
+  local re='^[[:space:]]*([-*+0-9.)]+[[:space:]]+)?[`"*_]*([a-z0-9]{2,63})[`"*_]*([[:space:]]*[|:][[:space:]]*(.*))?[[:space:]]*$'
   while IFS= read -r line || [[ -n $line ]]; do
     line=${line,,}; line=${line//$'\r'/}
-    if [[ $line =~ $re ]]; then add_candidate "${BASH_REMATCH[2]}"; fi
+    if [[ $line =~ $re ]]; then
+      meaning=${BASH_REMATCH[4]:-}
+      add_candidate "${BASH_REMATCH[2]}" "$meaning"
+    fi
   done
 }
 
@@ -1382,6 +1432,7 @@ cmd_suggest() {
   local agent out prompt eval_prompt eval_out candidate_list
   local -i agent_started
   local -a original_candidates=()
+  local -A original_meanings=()
   if ((!NO_CHECK && !TLDS_SET)); then
     die "suggest checks availability by default and requires an explicit TLD list; use --tld com,ma (or --tld=com,ma), or add --no-check"
   fi
@@ -1399,7 +1450,7 @@ cmd_suggest() {
   fi
   if ((PRINT_PROMPT)); then agent_prompt; return 0; fi
 
-  CANDIDATES=(); CAND_SEEN=()
+  CANDIDATES=(); CAND_SEEN=(); CANDIDATE_MEANING=()
   detect_agent; agent=$REPLY
   if [[ -n $agent ]]; then
     prompt=$(agent_prompt)
@@ -1419,27 +1470,37 @@ cmd_suggest() {
 
   if ((AGENT_EVAL)) && [[ -n $agent ]]; then
     original_candidates=("${CANDIDATES[@]}")
-    candidate_list=$(IFS=', '; printf '%s' "${original_candidates[*]}")
+    for c in "${original_candidates[@]}"; do original_meanings[$c]=${CANDIDATE_MEANING[$c]:-}; done
+    candidate_list=''
+    for c in "${original_candidates[@]}"; do
+      candidate_list+="${candidate_list:+, }$c"
+      if ((WITH_MEANING)) && [[ -n ${CANDIDATE_MEANING[$c]:-} ]]; then candidate_list+=" | ${CANDIDATE_MEANING[$c]}"; fi
+    done
     eval_prompt=$(agent_eval_prompt "$candidate_list")
     log_step "quality review prompt sent to agent: $agent"
     printf '%s\n' "$eval_prompt" >&2
     agent_started=$SECONDS
     if eval_out=$(run_agent "$agent" "$eval_prompt" 2>/dev/null); then
-      CANDIDATES=(); CAND_SEEN=()
+      CANDIDATES=(); CAND_SEEN=(); CANDIDATE_MEANING=()
       parse_agent_names <<< "$eval_out"
       if ((${#CANDIDATES[@]} == 0)); then
         CANDIDATES=("${original_candidates[@]}")
+        CANDIDATE_MEANING=(); for c in "${original_candidates[@]}"; do CANDIDATE_MEANING[$c]=${original_meanings[$c]:-}; done
         log_warn "agent review returned no usable names; keeping original candidates"
       fi
     else
       log_warn "agent review failed or timed out; keeping original candidates"
       CANDIDATES=("${original_candidates[@]}")
+      CANDIDATE_MEANING=(); for c in "${original_candidates[@]}"; do CANDIDATE_MEANING[$c]=${original_meanings[$c]:-}; done
     fi
     log_time "agent review took $((SECONDS - agent_started))s; final list has ${#CANDIDATES[@]} name(s)"
   elif ((AGENT_EVAL)); then
     log_warn "--agent-eval requires an available agent; local generator output was not reviewed"
   fi
 
+  for c in "${original_candidates[@]}"; do
+    [[ -n ${CANDIDATE_MEANING[$c]:-} ]] || CANDIDATE_MEANING[$c]=${original_meanings[$c]:-}
+  done
   for c in "${CANDIDATES[@]}"; do
     case " ${HISTORY_THIS_CANDIDATES[*]} " in *" $c "*) ;; *) HISTORY_THIS_CANDIDATES+=("$c") ;; esac
   done
@@ -1522,8 +1583,44 @@ interactive_menu() {
 # =============================================================================
 # Main
 # =============================================================================
+detect_resources() {
+  local detected=''
+  if command -v nproc >/dev/null 2>&1; then detected=$(nproc 2>/dev/null || true); fi
+  if ! is_posint "$detected" && command -v getconf >/dev/null 2>&1; then
+    detected=$(getconf _NPROCESSORS_ONLN 2>/dev/null || true)
+  fi
+  if ! is_posint "$detected" && command -v sysctl >/dev/null 2>&1; then
+    detected=$(sysctl -n hw.ncpu 2>/dev/null || true)
+  fi
+  is_posint "$detected" || detected=4
+  CPU_COUNT=$detected
+
+  if [[ -r /proc/meminfo ]]; then
+    read -r RAM_AVAILABLE_MB SWAP_FREE_MB < <(
+      awk '/^MemAvailable:/ {mem=$2} /^SwapFree:/ {swap=$2} END {printf "%d %d\n", mem/1024, swap/1024}' /proc/meminfo
+    )
+  fi
+}
+
+configure_parallelism() {
+  ((JOBS_SET)) && return 0
+  JOBS=$((CPU_COUNT + 4))
+  ((JOBS > 16)) && JOBS=16
+  ((JOBS < 4)) && JOBS=4
+  if ((RAM_AVAILABLE_MB > 0 && RAM_AVAILABLE_MB < 512)); then JOBS=4; fi
+}
+
+log_resource_report() {
+  local ram='n/a' swap='n/a'
+  ((RAM_AVAILABLE_MB > 0)) && ram="$((RAM_AVAILABLE_MB / 1024)) GiB available"
+  ((SWAP_FREE_MB > 0)) && swap="$((SWAP_FREE_MB / 1024)) GiB free"
+  log_time "resources: $CPU_COUNT logical CPU cores detected; $JOBS concurrent network workers; RAM $ram; swap $swap"
+}
+
 main() {
   parse_args "$@"
+  detect_resources
+  configure_parallelism
   setup_colors
   case $MODE in
     help|"") if [[ $MODE == help ]]; then usage; return 0; fi ;;
