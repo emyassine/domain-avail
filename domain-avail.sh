@@ -606,11 +606,11 @@ probe_whois() { # domain host
   if [[ ! -s $raw ]]; then
     rm -f "$raw"; emit UNKNOWN whois '' '' '' "whois $host: no response (rc=$rc)"; return 0
   fi
-  if grep -qiE "$RE_WHOIS_AVAIL" "$raw"; then
-    rm -f "$raw"; emit AVAILABLE whois '' '' '' "whois $host: not found"; return 0
-  fi
   if grep -qiE "$RE_WHOIS_RESERVED" "$raw"; then
     rm -f "$raw"; emit RESERVED whois '' '' '' "whois $host: reserved/prohibited"; return 0
+  fi
+  if grep -qiE "$RE_WHOIS_AVAIL" "$raw"; then
+    rm -f "$raw"; emit AVAILABLE whois '' '' '' "whois $host: not found"; return 0
   fi
   if grep -qiE '^[[:space:]]*domain( name)?:' "$raw"; then
     created=$(short_date "$(whois_field "$raw" '^[ \t]*(creation date|created( on)?|registered( on)?|registration (date|time)|domain registered)[ \t]*$')")
