@@ -69,9 +69,10 @@ script. Use `-o FILE` only when you need a specific path.
 
 Auto-detection: one positional domain (`name.com` or `name.ma`) uses boolean
 mode. Multiple positional domains print an ASCII status table as each check
-finishes, with the current domain announced while it is being checked. Use the explicit
-`check` subcommand or `-b` to force scripting-friendly boolean output. Bare
-names use `batch` mode.
+finishes. If one network query takes more than 10 seconds, a temporary wait
+message appears and clears when the result arrives. Use the explicit `check`
+subcommand or `-b` to force scripting-friendly boolean output. Bare names use
+`batch` mode.
 
 All input domains, names, and TLDs are lowercased before cache lookup and
 before any network check.

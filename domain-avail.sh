@@ -234,7 +234,8 @@ mkdir -p "$CACHE_DIR" || die "cannot create cache directory: $CACHE_DIR"
 TMP_NAMES="$(mktemp)" || die "mktemp failed"
 TMP_ROWS="$(mktemp)"  || die "mktemp failed"
 TMP_CHECK_ROWS="$(mktemp)" || die "mktemp failed"
-trap 'rm -f "$TMP_NAMES" "$TMP_ROWS" "$TMP_CHECK_ROWS" "$TMP_NAMES.norm" "$TMP_ROWS.tmp"' EXIT
+TMP_PROBE="$(mktemp)" || die "mktemp failed"
+trap 'rm -f "$TMP_NAMES" "$TMP_ROWS" "$TMP_CHECK_ROWS" "$TMP_PROBE" "$TMP_NAMES.norm" "$TMP_ROWS.tmp"' EXIT
 
 now_utc() { date -u +"%Y-%m-%dT%H:%M:%SZ"; }
 
@@ -260,6 +261,31 @@ check_table_start() {
   check_table_border
   check_table_row DOMAIN STATUS DETAIL
   check_table_border
+}
+
+run_probe() { # probe function, domain label
+  local probe="$1" name="$2" pid elapsed=0 notice=0
+  if [ "$AUTO_TABLE" -ne 1 ] || [ ! -t 2 ]; then
+    "$probe" "$name"
+    return
+  fi
+
+  : > "$TMP_PROBE"
+  "$probe" "$name" > "$TMP_PROBE" &
+  pid=$!
+  while kill -0 "$pid" 2>/dev/null; do
+    sleep 0.2
+    elapsed=$((elapsed+1))
+    if [ "$elapsed" -ge 50 ] && [ $(((elapsed-50) % 50)) -eq 0 ]; then
+      printf '\rToujours en cours : %s (%ss)' "$name" "$((elapsed/5))" >&2
+      notice=1
+    fi
+  done
+  wait "$pid" || true
+  if [ "$notice" -eq 1 ]; then
+    printf '\r\033[K' >&2
+  fi
+  cat "$TMP_PROBE"
 }
 
 cache_get() { # $1=name $2=tld -> prints status or nothing
@@ -379,16 +405,13 @@ run_check() {
 
     name="${BASH_REMATCH[1]}"
     tld="${BASH_REMATCH[3]}"
-    if [ "$AUTO_TABLE" -eq 1 ]; then
-      printf 'Checking %s ...\n' "$domain" >&2
-    fi
     if cached="$(cache_get "$name" "$tld")" && [ -n "$cached" ]; then
       res="$cached"
       st="${cached%%|*}"
     else
       case "$tld" in
-        com) res="$(check_com "$name")"; sleep "$DELAY_COM" ;;
-        ma)  res="$(check_ma  "$name")"; sleep "$DELAY_MA"  ;;
+        com) res="$(run_probe check_com "$name")"; sleep "$DELAY_COM" ;;
+        ma)  res="$(run_probe check_ma  "$name")"; sleep "$DELAY_MA"  ;;
         *)   printf 'false\n'; printf '%s: unsupported TLD: %s\n' "$PROG" "$tld" >&2; all_ok=0; continue ;;
       esac
       st="${res%%|*}"
