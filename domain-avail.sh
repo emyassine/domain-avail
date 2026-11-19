@@ -256,7 +256,9 @@ ${b}${c}ENGINE${r}
   ${g}    --refresh${r}          ignore cache and re-download IANA data      ${g}--no-cache${r}  disable cache read/write
 
 ${b}${c}SUGGEST${r}
-  Suggestions require an explicit TLD list: --tld com,ma (or --tld=com,ma).
+  By default, suggest generates names and checks their availability.
+  It prints the exact agent prompt before calling the agent. --no-check prints names only.
+  An explicit TLD list is required (e.g. --tld=com,ma).
   ${g}    --agent NAME${r}       auto | none | claude | codex | opencode | grok | gemini   (default: auto)
   ${g}    --agent-cmd CMD${r}    custom command; prompt on stdin, names on stdout (run via bash -c)
   ${g}-n, --count N${r}          number of candidates (default ${COUNT})
@@ -1116,8 +1118,10 @@ parse_agent_names() { # stdin: agent output -> CANDIDATES
 }
 
 cmd_suggest() {
-  local agent out
-  ((TLDS_SET)) || die "suggest requires an explicit TLD list; use --tld com,ma (or --tld=com,ma)"
+  local agent out prompt
+  if ((!NO_CHECK && !TLDS_SET)); then
+    die "suggest checks availability by default and requires an explicit TLD list; use --tld com,ma (or --tld=com,ma), or add --no-check"
+  fi
   KEYWORDS=("${POSITIONAL[@]}")
   if [[ -n $INPUT_FILE && $INPUT_FILE != - && -r $INPUT_FILE ]]; then
     local line; while IFS= read -r line; do ingest_line "$line"; done < "$INPUT_FILE"
@@ -1129,8 +1133,10 @@ cmd_suggest() {
   CANDIDATES=(); CAND_SEEN=()
   detect_agent; agent=$REPLY
   if [[ -n $agent ]]; then
-    log_step "asking agent: $agent"
-    out=$(run_agent "$agent" "$(agent_prompt)" 2>/dev/null) || log_warn "agent '$agent' failed or timed out"
+    prompt=$(agent_prompt)
+    log_step "prompt sent to agent: $agent"
+    printf '%s\n' "$prompt" >&2
+    out=$(run_agent "$agent" "$prompt" 2>/dev/null) || log_warn "agent '$agent' failed or timed out"
     parse_agent_names <<< "$out"
     log_info "agent returned ${#CANDIDATES[@]} usable name(s)"
   fi
@@ -1140,7 +1146,7 @@ cmd_suggest() {
   fi
   ((${#CANDIDATES[@]} > 0)) || die "could not generate any candidate"
 
-  if ((NO_CHECK)); then printf '%s\n' "${CANDIDATES[@]}"; return 0; fi
+  if ((!SUGGEST_CHECK || NO_CHECK)); then printf '%s\n' "${CANDIDATES[@]}"; return 0; fi
 
   TOKENS=("${CANDIDATES[@]}")
   ((ONLY_SET || SHOW_ALL)) || ONLY=available
