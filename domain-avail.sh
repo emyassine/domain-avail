@@ -61,6 +61,8 @@ declare -- INPUT_FILE="" OUT_FILE="" TLDS_RAW="${DOMAIN_AVAIL_TLDS:-com,ma}"
 declare -i TLDS_SET=0
 [[ -n ${DOMAIN_AVAIL_TLDS+x} ]] && TLDS_SET=1
 declare -- MANDATORY_TLD_RAW="" AGENT_CMD="" CONTEXT_TEXT="" PROMPT_EXTRA=""
+declare -- HISTORY_FILE="${PWD}/.domain-avail.history" HISTORY_SCOPE="request" HISTORY_ELAPSED="" HISTORY_CHECKED_AT="" REQUEST_KEY="" INDUSTRY_KEY=""
+declare -ri HISTORY_TTL=2592000
 declare -- OUTPUT_DIR="${OUTPUT_DIR:-${SCRIPT_DIR}/output}"
 declare -- CACHE_DIR="${DOMAIN_AVAIL_CACHE_DIR:-${XDG_CACHE_HOME:-${HOME:-${TMPDIR:-/tmp}}/.cache}/domain-avail}"
 declare -- DELAY="0.5"                      # decimal string (seconds)
@@ -78,8 +80,8 @@ declare -i OUT_TTY=0 ERR_TTY=0 IN_TTY=0
 [[ -t 2 ]] && ERR_TTY=1
 [[ -t 0 ]] && IN_TTY=1
 
-declare -a POSITIONAL=() TOKENS=() DOMAINS=() TLD_ARRAY=() MANDATORY_TLD_ARRAY=() ROWS_ALL=() ROWS=() KEYWORDS=() CANDIDATES=()
-declare -A SGR_OUT=() SGR_ERR=()
+declare -a POSITIONAL=() TOKENS=() DOMAINS=() TLD_ARRAY=() MANDATORY_TLD_ARRAY=() ROWS_ALL=() ROWS=() KEYWORDS=() CANDIDATES=() HISTORY_OLD_CANDIDATES=() HISTORY_THIS_CANDIDATES=()
+declare -A SGR_OUT=() SGR_ERR=() HISTORY_RECORD=() HISTORY_NAME_SEEN=()
 declare -A TLD_CHAIN=()                     # root TLD -> "rdap:URL whois:HOST dns"
 declare -A RDAP_SERVER=() WHOIS_SERVER=()   # user overrides (root TLD -> value)
 declare -A DELAY_TLD=([ma]="1.2")           # per-TLD politeness delays (overridable)
@@ -177,9 +179,21 @@ status_style() {
 
 # Left-pad THEN colour (so ANSI codes never break column alignment).
 cell() {
-  local text=$1 width=$2 style=${3:-} padded
-  printf -v padded '%-*s' "$width" "$text"
+  local LC_ALL=C text=$1 width=$2 style=${3:-} padded display_len i
+  if [[ $text == *[$'\200'-$'\377']* ]]; then
+    display_len=$(display_width "$text")
+  else
+    display_len=${#text}
+  fi
+  padded=$text
+  for ((i = display_len; i < width; i++)); do padded+=' '; done
   if [[ -n $style ]]; then paint OUT "$style" "$padded"; else printf '%s' "$padded"; fi
+}
+
+display_width() {
+  local LC_ALL=${LANG:-C.UTF-8}
+  [[ $LC_ALL == C ]] && LC_ALL=C.UTF-8
+  LC_ALL=$LC_ALL awk '{print length($0)}' <<< "$1"
 }
 
 trunc() { # trunc text width -> REPLY
@@ -213,6 +227,7 @@ progress_start() { # idx domain
 
 progress() { # idx domain status elapsed_seconds
   if ((VERBOSITY >= 2 || (VERBOSITY == 1 && ERR_TTY))); then
+    [[ $MODE == suggest ]] && return 0
     printf '  %s %s %s (%ss)\n' "$(paint ERR dim "[$1/$TOTAL]")" "$2" \
       "$(paint ERR "$(status_style "$3")" "$3")" "$4" >&2
   fi
@@ -270,14 +285,16 @@ ${b}${c}SUGGEST${r}
   An explicit TLD list is required (e.g. --tld=com,ma).
   ${g}    --agent NAME${r}       auto | none | claude | codex | opencode | grok | gemini   (default: auto)
   ${g}    --agent-cmd CMD${r}    custom command; prompt on stdin, names on stdout (run via bash -c)
-  ${g}-n, --count N${r}          request N candidate names (default ${COUNT}); checks = N × number of TLDs
+  ${g}-n, --count N${r}          request N candidate names (default ${COUNT}); checks = usable names × number of TLDs
   ${g}    --style S${r}          brandable | short | descriptive | playful | ...  (free text for agents)
-  ${g}    --single-word${r}      require one coined word; no joined keywords or phrases
+  ${g}    --single-word${r}      require one coined word, not a blend of two recognizable words
   ${g}    --lang CODE${r}        fr | en | ...  (language/affix hint)
   ${g}    --context TEXT${r}     describe project/industry (alias: --industry)
   ${g}    --prompt-extra TEXT${r} add a custom instruction to the agent prompt
   ${g}    --agent-eval${r}       ask the same agent to review and improve its candidate list
-  ${g}    --all${r}              show unavailable candidates too (default: available only)
+  The current directory's .domain-avail.history is used by default; --no-history disables it.
+  ${g}    --history-scope S${r}  request (default) or industry for name de-duplication scope
+  ${g}    --all${r}              show all result rows (suggest already shows all TLD statuses)
   ${g}    --no-check${r}         print candidate names without checking domains
   ${g}    --print-prompt${r}     print the agent prompt and exit
   ${g}    --agent-timeout SEC${r} agent time limit (default ${AGENT_TIMEOUT})
@@ -354,6 +371,9 @@ parse_args() {
       --context|--industry) need_arg "$@"; CONTEXT_TEXT=$2; shift 2 ;;
       --prompt-extra) need_arg "$@"; PROMPT_EXTRA=$2; shift 2 ;;
       --agent-eval|--with-agent-eval) AGENT_EVAL=1; shift ;;
+      --history) HISTORY_FILE="$PWD/.domain-avail.history"; shift ;;
+      --no-history) HISTORY_FILE=""; shift ;;
+      --history-scope) need_arg "$@"; HISTORY_SCOPE=${2,,}; shift 2 ;;
       -b|--boolean)   FORMAT=bool; shift ;;
       -a|--available) ONLY=available; ONLY_SET=1; shift ;;
       --all)          SHOW_ALL=1; shift ;;
@@ -389,6 +409,7 @@ parse_args() {
 
 validate_options() {
   [[ -z $MANDATORY_TLD_RAW || $MODE == suggest ]] || die "--mandatory-tld is only valid with suggest"
+  case $HISTORY_SCOPE in request|industry) ;; *) die "--history-scope must be request or industry" ;; esac
   case $FORMAT  in auto|table|csv|tsv|json|jsonl|bool|names) ;; *) die "invalid --format: $FORMAT" ;; esac
   case $METHOD  in auto|rdap|whois|dns) ;; *) die "invalid --method: $METHOD" ;; esac
   case $COLOR_MODE in auto|always|never) ;; *) die "invalid --color: $COLOR_MODE" ;; esac
@@ -591,6 +612,101 @@ cache_put() { # domain record
   printf '%s%s%s\n' "$now" "$SEP" "$2" > "$f.tmp.$$" && mv -f "$f.tmp.$$" "$f"
 }
 
+history_normalize_text() {
+  local raw=$1 ascii
+  ascii=$(iconv -f UTF-8 -t ASCII//TRANSLIT 2>/dev/null <<< "$raw" || printf '%s' "$raw")
+  REPLY=$(printf '%s' "$ascii" | LC_ALL=C tr '[:upper:]' '[:lower:]' | sed -E 's/[^a-z0-9]+/ /g; s/^ +//; s/ +$//; s/ +/ /g')
+}
+
+history_prepare_key() {
+  local keywords industry extra
+  history_normalize_text "${KEYWORDS[*]}"; keywords=$REPLY
+  history_normalize_text "$CONTEXT_TEXT"; industry=$REPLY
+  history_normalize_text "$PROMPT_EXTRA"; extra=$REPLY
+  REQUEST_KEY=$(jq -cn --arg keywords "$keywords" --arg industry "$industry" \
+    --arg extra "$extra" --arg style "$STYLE" --arg lang "$LANG_HINT" \
+    --argjson single_word "$SINGLE_WORD" '
+      def tokens: split(" ") | map(select(length > 0)) | unique;
+      {keywords:($keywords|tokens), industry:($industry|tokens), style:$style,
+       language:$lang, extra:$extra, single_word:($single_word == 1)}')
+  INDUSTRY_KEY=$(jq -cn --arg industry "$industry" --arg style "$STYLE" \
+    --arg lang "$LANG_HINT" --argjson single_word "$SINGLE_WORD" '
+      def tokens: split(" ") | map(select(length > 0)) | unique;
+      {industry:($industry|tokens), style:$style, language:$lang, single_word:($single_word == 1)}')
+}
+
+history_load() {
+  local domain status method created expires registrar detail checked duration epoch name tld now
+  HISTORY_RECORD=(); HISTORY_NAME_SEEN=(); HISTORY_OLD_CANDIDATES=()
+  [[ -n $HISTORY_FILE && -r $HISTORY_FILE ]] || return 0
+  printf -v now '%(%s)T' -1
+  while IFS=$'\t' read -r domain status method created expires registrar detail checked duration epoch; do
+    is_uint "$epoch" || continue
+    ((now - epoch <= HISTORY_TTL)) || continue
+    case $status in REGISTERED|RESERVED|INVALID) ;; *) continue ;; esac
+    name=${domain%%.*}; tld=${domain#*.}
+    HISTORY_RECORD[$domain]=$(emit "$domain" "$name" "$tld" "$status" history \
+      "$created" "$expires" "$registrar" "history result from $checked" "$checked" 2 "$duration")
+  done < <(jq -r 'select(.type == "check") | [.domain,.status,.method,.created,.expires,.registrar,.detail,.checked_at,.duration_seconds,.epoch] | @tsv' "$HISTORY_FILE" 2>/dev/null)
+  local old_name
+  while IFS= read -r old_name; do
+    [[ -n $old_name ]] || continue
+    HISTORY_NAME_SEEN[$old_name]=1
+    HISTORY_OLD_CANDIDATES+=("$old_name")
+  done < <(jq -sr --arg key "$REQUEST_KEY" \
+    --arg industry_key "$INDUSTRY_KEY" --arg scope "$HISTORY_SCOPE" \
+    '[.[] | select(.type == "request" and (.key == $key or ($scope == "industry" and .industry_key == $industry_key))) | .candidates[]?] | reverse | reduce .[] as $n ([]; if index($n) == null then . + [$n] else . end) | .[:300][]?' \
+    "$HISTORY_FILE" 2>/dev/null)
+}
+
+history_get() { # domain -> REPLY internal result row
+  [[ -n $HISTORY_FILE && ! $REFRESH && -n ${HISTORY_RECORD[$1]+x} ]] || return 1
+  local domain name tld status method created expires registrar detail checked cached duration
+  IFS=$SEP read -r domain name tld status method created expires registrar detail checked cached duration \
+    <<< "${HISTORY_RECORD[$1]}"
+  HISTORY_ELAPSED=$duration
+  HISTORY_CHECKED_AT=$checked
+  REPLY=$(emit "$status" "$method" "$created" "$expires" "$registrar" "$detail")
+}
+
+history_save_request() {
+  local candidates_json tlds_json mandatory_tlds_json
+  [[ -n $HISTORY_FILE ]] || return 0
+  candidates_json=$(printf '%s\n' "${HISTORY_THIS_CANDIDATES[@]}" | jq -Rsc 'split("\n") | map(select(length > 0))')
+  tlds_json=$(printf '%s\n' "${TLD_ARRAY[@]}" | jq -Rsc 'split("\n") | map(select(length > 0))')
+  mandatory_tlds_json=$(printf '%s\n' "${MANDATORY_TLD_ARRAY[@]}" | jq -Rsc 'split("\n") | map(select(length > 0))')
+  jq -cn --arg key "$REQUEST_KEY" --arg industry_key "$INDUSTRY_KEY" --arg requested_at "$(now_utc)" \
+    --arg keywords "${KEYWORDS[*]}" --arg industry "$CONTEXT_TEXT" --arg style "$STYLE" \
+    --arg language "$LANG_HINT" --arg extra "$PROMPT_EXTRA" --argjson single_word "$SINGLE_WORD" \
+    --argjson no_check "$NO_CHECK" --argjson count "$COUNT" --arg agent "${agent:-local}" \
+    --argjson agent_eval "$AGENT_EVAL" --argjson tlds "$tlds_json" \
+    --argjson mandatory_tlds "$mandatory_tlds_json" --arg candidates_scope "$HISTORY_SCOPE" \
+    --argjson candidates "$candidates_json" \
+    '{type:"request",key:$key,requested_at:$requested_at,availability_check_requested:($no_check == 0),keywords:$keywords,industry:$industry,
+      style:$style,language:$language,prompt_extra:$extra,single_word:($single_word == 1),
+      industry_key:$industry_key,history_scope:$candidates_scope,requested_count:$count,agent:$agent,
+      agent_eval:$agent_eval,tlds:$tlds,mandatory_tlds:$mandatory_tlds,candidates:$candidates}' \
+    >> "$HISTORY_FILE" || log_warn "cannot write history: $HISTORY_FILE"
+}
+
+history_save_checks() {
+  [[ -n $HISTORY_FILE ]] || return 0
+  {
+    local row d n t st me cr ex rg de ca ck duration epoch
+    epoch=$(date +%s)
+    for row in "${ROWS_ALL[@]}"; do
+      IFS=$SEP read -r d n t st me cr ex rg de ca ck duration <<< "$row"
+      ((ck == 2)) && continue
+      printf '%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\n' \
+        "$d" "$st" "$me" "$cr" "$ex" "$rg" "$de" "$ca" "$duration" "$epoch"
+    done
+  } | jq -Rrc --arg sep $'\t' --arg request_key "${REQUEST_KEY:-}" '
+    split($sep) as $r | {type:"check",domain:$r[0],status:$r[1],method:$r[2],
+      created:$r[3],expires:$r[4],registrar:$r[5],detail:$r[6],checked_at:$r[7],
+      duration_seconds:($r[8]|tonumber),epoch:($r[9]|tonumber),request_key:$request_key}' >> "$HISTORY_FILE" \
+      || log_warn "cannot append check results to history: $HISTORY_FILE"
+}
+
 # =============================================================================
 # Probes — each prints one record: status|method|created|expires|registrar|detail
 # =============================================================================
@@ -758,7 +874,7 @@ check_one() { # idx domain -> writes $WORK/res.idx
   local -i idx=$1 cached=0 started=$SECONDS elapsed
   local domain=$2
   local name=${domain%%.*} tld=${domain#*.} root=${domain##*.}
-  local rec='' st='' me='' cr='' ex='' rg='' de='' step kind arg res notes='' ts dl
+  local rec='' st='' me='' cr='' ex='' rg='' de='' step kind arg res notes='' ts dl history_duration=''
   ts=$(now_utc)
   progress_start "$idx" "$domain"
 
@@ -766,6 +882,8 @@ check_one() { # idx domain -> writes $WORK/res.idx
     rec=$(emit INVALID syntax '' '' '' 'invalid domain syntax')
   elif ! tld_exists "$root"; then
     rec=$(emit INVALID iana '' '' '' "unknown TLD .$root")
+  elif [[ $MODE == suggest ]] && history_get "$domain"; then
+    rec=$REPLY; cached=2; history_duration=$HISTORY_ELAPSED; ts=$HISTORY_CHECKED_AT
   elif cache_get "$domain"; then
     rec=$REPLY; cached=1
   else
@@ -795,8 +913,8 @@ check_one() { # idx domain -> writes $WORK/res.idx
   fi
 
   IFS=$SEP read -r st me cr ex rg de <<< "$rec"
-  emit "$domain" "$name" "$tld" "$st" "$me" "$cr" "$ex" "$rg" "$de" "$ts" "$cached" > "$WORK/res.$idx"
-  elapsed=$((SECONDS - started))
+  if ((cached == 2)); then elapsed=${history_duration:-0}; else elapsed=$((SECONDS - started)); fi
+  emit "$domain" "$name" "$tld" "$st" "$me" "$cr" "$ex" "$rg" "$de" "$ts" "$cached" "$elapsed" > "$WORK/res.$idx"
   progress "$idx" "$domain" "$st" "$elapsed"
 }
 
@@ -835,7 +953,7 @@ run_pipeline() {
       IFS= read -r line < "$WORK/res.$i"
       ROWS_ALL+=("$line")
     else
-      ROWS_ALL+=("$(emit "${DOMAINS[i-1]}" '' '' UNKNOWN none '' '' '' 'check did not complete' "$(now_utc)" 0)")
+      ROWS_ALL+=("$(emit "${DOMAINS[i-1]}" '' '' UNKNOWN none '' '' '' 'check did not complete' "$(now_utc)" 0 0)")
     fi
   done
   count_rows
@@ -899,29 +1017,29 @@ filter_rows() {
 csv_q() { local v=${1//\"/\"\"}; printf '"%s"' "$v"; }
 
 render_csv() {
-  local row d n t st me cr ex rg de ca ck
-  ((NO_HEADER)) || printf 'domain,name,tld,status,method,created,expires,registrar,detail,checked_at\n'
+  local row d n t st me cr ex rg de ca ck duration
+  ((NO_HEADER)) || printf 'domain,name,tld,status,method,created,expires,registrar,detail,checked_at,duration_seconds\n'
   for row in "${ROWS[@]}"; do
-    IFS=$SEP read -r d n t st me cr ex rg de ca ck <<< "$row"
-    printf '%s,%s,%s,%s,%s,%s,%s,%s,%s,%s\n' \
+    IFS=$SEP read -r d n t st me cr ex rg de ca ck duration <<< "$row"
+    printf '%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s\n' \
       "$(csv_q "$d")" "$(csv_q "$n")" "$(csv_q "$t")" "$st" "$me" "$cr" "$ex" \
-      "$(csv_q "$rg")" "$(csv_q "$de")" "$ca"
+      "$(csv_q "$rg")" "$(csv_q "$de")" "$ca" "$duration"
   done
 }
 
 render_tsv() {
-  local row d n t st me cr ex rg de ca ck
-  ((NO_HEADER)) || printf 'domain\tname\ttld\tstatus\tmethod\tcreated\texpires\tregistrar\tdetail\tchecked_at\n'
+  local row d n t st me cr ex rg de ca ck duration
+  ((NO_HEADER)) || printf 'domain\tname\ttld\tstatus\tmethod\tcreated\texpires\tregistrar\tdetail\tchecked_at\tduration_seconds\n'
   for row in "${ROWS[@]}"; do
-    IFS=$SEP read -r d n t st me cr ex rg de ca ck <<< "$row"
-    printf '%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\n' "$d" "$n" "$t" "$st" "$me" "$cr" "$ex" "$rg" "$de" "$ca"
+    IFS=$SEP read -r d n t st me cr ex rg de ca ck duration <<< "$row"
+    printf '%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\n' "$d" "$n" "$t" "$st" "$me" "$cr" "$ex" "$rg" "$de" "$ca" "$duration"
   done
 }
 
 declare -r JQ_REC='split($sep) | {
   domain: .[0], name: .[1], tld: .[2], status: .[3], available: (.[3] == "AVAILABLE"),
   method: .[4], created: .[5], expires: .[6], registrar: .[7], detail: .[8],
-  checked_at: .[9], cached: (.[10] == "1")
+  checked_at: .[9], cached: (.[10] == "1"), duration_seconds: (.[11] | tonumber)
 } | with_entries(if .value == "" then .value = null else . end)'
 
 render_json() {
@@ -960,29 +1078,29 @@ term_width() {
 }
 
 render_table() {
-  local row d n t st me cr ex rg de ca ck i
-  local -a A_d=() A_st=() A_me=() A_cr=() A_ex=() A_in=()
+  local row d n t st me cr ex rg de ca ck duration i
+  local -a A_d=() A_st=() A_me=() A_cr=() A_ex=() A_in=() A_dur=()
   local -i wd=6 wi tw
   for row in "${ROWS[@]}"; do
-    IFS=$SEP read -r d n t st me cr ex rg de ca ck <<< "$row"
+    IFS=$SEP read -r d n t st me cr ex rg de ca ck duration <<< "$row"
     [[ -n $rg ]] && de="registrar=$rg${de:+; $de}"
     ((ck == 1)) && me="$me*"
-    A_d+=("$d"); A_st+=("$st"); A_me+=("${me:--}"); A_cr+=("${cr:--}"); A_ex+=("${ex:--}"); A_in+=("$de")
-    ((${#d} > wd)) && wd=${#d}
+    A_d+=("$d"); A_st+=("$st"); A_me+=("${me:--}"); A_cr+=("${cr:--}"); A_ex+=("${ex:--}"); A_in+=("$de"); A_dur+=("${duration}s")
+    display_width "$d"; (REPLY > wd) && wd=$REPLY
   done
   tw=$(term_width)
-  wi=$((tw - wd - 55)); ((wi < 20)) && wi=20
+  wi=$((tw - wd - 65)); ((wi < 20)) && wi=20
 
-  local b1 b2 b3 b4 b5 b6
+  local b1 b2 b3 b4 b5 b6 b7
   hline $((wd + 2));  b1=$REPLY
   hline 12; b2=$REPLY; hline 12; b3=$REPLY; hline 12; b4=$REPLY
-  hline 8;  b5=$REPLY; hline $((wi + 2)); b6=$REPLY
-  local border="+$b1+$b2+$b3+$b4+$b5+$b6+"
+  hline 8; b5=$REPLY; hline 10; b6=$REPLY; hline $((wi + 2)); b7=$REPLY
+  local border="+$b1+$b2+$b3+$b4+$b5+$b6+$b7+"
 
   paint OUT dim "$border"; printf '\n'
   printf '| '; cell DOMAIN "$wd" bold; printf ' | '; cell STATUS 10 bold
   printf ' | '; cell CREATED 10 bold; printf ' | '; cell EXPIRES 10 bold
-  printf ' | '; cell METHOD 6 bold; printf ' | '; cell INFO "$wi" bold; printf ' |\n'
+  printf ' | '; cell METHOD 6 bold; printf ' | '; cell TIME 8 bold; printf ' | '; cell INFO "$wi" bold; printf ' |\n'
   paint OUT dim "$border"; printf '\n'
   for ((i = 0; i < ${#A_d[@]}; i++)); do
     trunc "${A_in[i]}" "$wi"
@@ -991,11 +1109,59 @@ render_table() {
     printf ' | '; cell "${A_cr[i]}" 10
     printf ' | '; cell "${A_ex[i]}" 10
     printf ' | '; cell "${A_me[i]}" 6 dim
+    printf ' | '; cell "${A_dur[i]}" 8
     printf ' | '; cell "$REPLY" "$wi" dim
     printf ' |\n'
   done
   paint OUT dim "$border"; printf '\n'
   render_summary
+}
+
+render_suggest_matrix() {
+  local row d n t st me cr ex rg de ca ck duration key name i border hist_count=0
+  local -a names=()
+  local -A seen=() values=() widths=()
+  local -i name_width=4 w
+  for t in "${TLD_ARRAY[@]}"; do widths[$t]=$((${#t} + 1)); done
+  for row in "${ROWS[@]}"; do
+    IFS=$SEP read -r d n t st me cr ex rg de ca ck duration <<< "$row"
+    if [[ -z ${seen[$n]+x} ]]; then seen[$n]=1; names+=("$n"); fi
+    key="$n$SEP$t"
+    values[$key]="$st (${duration}s)"
+    if ((ck == 2)); then values[$key]+='*'; hist_count+=1; fi
+    ((${#values[$key]} > ${widths[$t]:-0})) && widths[$t]=${#values[$key]}
+    ((${#t} + 1 > ${widths[$t]:-0})) && widths[$t]=$((${#t} + 1))
+    ((${#n} > name_width)) && name_width=${#n}
+  done
+  border='+'
+  hline $((name_width + 2)); border+="$REPLY+"
+  for t in "${TLD_ARRAY[@]}"; do
+    w=${widths[$t]}
+    hline $((w + 2)); border+="$REPLY+"
+  done
+  paint OUT dim "$border"; printf '\n| '; cell NAME "$name_width" bold
+  for t in "${TLD_ARRAY[@]}"; do
+    w=${widths[$t]}
+    printf ' | '; cell ".$t" "$w" bold
+  done
+  printf ' |\n'; paint OUT dim "$border"; printf '\n'
+  for name in "${names[@]}"; do
+    printf '| '; cell "$name" "$name_width"
+    for t in "${TLD_ARRAY[@]}"; do
+      w=${widths[$t]}; key="$name$SEP$t"
+      printf ' | '; cell "${values[$key]:--}" "$w"
+    done
+    printf ' |\n'
+  done
+  paint OUT dim "$border"; printf '\n'
+  if ((hist_count > 0)); then
+    printf '%s\n' '  * previously checked result from .domain-avail.history'
+  fi
+  render_summary
+}
+
+render_table_for_mode() {
+  if [[ $MODE == suggest ]]; then render_suggest_matrix; else render_table; fi
 }
 
 render_summary() {
@@ -1038,7 +1204,7 @@ present() {
     mkdir -p "$(dirname -- "$OUT_FILE")" 2>/dev/null || die "cannot create directory for $OUT_FILE"
     ( SGR_OUT=(); render "$fmt" ) > "$OUT_FILE" || die "cannot write $OUT_FILE"
     log_ok "saved: $OUT_FILE"
-    if ((OUT_TTY)); then render table; fi
+    if ((OUT_TTY)); then render_table_for_mode; fi
     return 0
   fi
   if [[ $fmt == auto ]]; then
@@ -1046,7 +1212,7 @@ present() {
     elif ((OUT_TTY)); then fmt=table
     else fmt=csv; fi
   fi
-  render "$fmt"
+  if [[ $fmt == table && $MODE == suggest ]]; then render_suggest_matrix; else render "$fmt"; fi
 }
 
 final_exit_code() {
@@ -1070,12 +1236,14 @@ slugify() {
 }
 
 add_candidate() {
-  local c=${1:-}
+  local LC_ALL=C c=${1:-}
   [[ -n $c ]] || return 0
+  [[ $c =~ ^[a-z0-9]+$ ]] || return 0
   ((${#CANDIDATES[@]} >= COUNT)) && return 0
   ((${#c} >= 2 && ${#c} <= 63)) || return 0
   [[ $STYLE == short ]] && ((${#c} > 8)) && return 0
   [[ -n ${CAND_SEEN[$c]+x} ]] && return 0
+  [[ -n ${HISTORY_NAME_SEEN[$c]+x} ]] && return 0
   CAND_SEEN[$c]=1
   CANDIDATES+=("$c")
 }
@@ -1132,9 +1300,13 @@ ${PROMPT_EXTRA:+Additional instruction from the user: ${PROMPT_EXTRA}
 
 Rules:
 - Output ONLY the names, one per line. No numbering, no bullets, no explanations, no TLD.
-- Lowercase ASCII letters, digits and hyphens only; 3 to 15 characters; easy to pronounce and spell.
+- Lowercase ASCII letters and digits only; no accents, hyphens, or other punctuation; 3 to 15 characters.
 - Avoid existing well-known brands and trademarks.
 EOF
+  if ((${#HISTORY_OLD_CANDIDATES[@]} > 0)); then
+    local IFS=', '
+    printf 'Names already requested in the selected history scope; do not repeat: %s\n' "${HISTORY_OLD_CANDIDATES[*]}"
+  fi
   if ((SINGLE_WORD)); then
     cat <<'EOF'
 - Each suggestion must be exactly one coined word, with no spaces, hyphens, or joining of two recognizable words.
@@ -1198,7 +1370,7 @@ run_agent() { # agent prompt -> stdout
 }
 
 parse_agent_names() { # stdin: agent output -> CANDIDATES
-  local line
+  local LC_ALL=C line
   local re='^[[:space:]]*([-*+0-9.)]+[[:space:]]+)?[`"*_]*([a-z0-9][a-z0-9-]*[a-z0-9]|[a-z0-9])(\.[a-z0-9.-]+)?[`"*_]*[[:space:]]*(([-:(]|[[:space:]]-).*)?$'
   while IFS= read -r line || [[ -n $line ]]; do
     line=${line,,}; line=${line//$'\r'/}
@@ -1219,6 +1391,12 @@ cmd_suggest() {
     KEYWORDS+=("${TOKENS[@]}"); TOKENS=()
   fi
   ((${#KEYWORDS[@]} > 0)) || die "suggest needs at least one keyword"
+  REQUEST_KEY=''
+  if [[ -n $HISTORY_FILE ]]; then
+    history_prepare_key
+    history_load
+    log_info "loaded request and availability history from $HISTORY_FILE"
+  fi
   if ((PRINT_PROMPT)); then agent_prompt; return 0; fi
 
   CANDIDATES=(); CAND_SEEN=()
@@ -1237,10 +1415,11 @@ cmd_suggest() {
     suggest_local
   fi
   ((${#CANDIDATES[@]} > 0)) || die "could not generate any candidate"
+  HISTORY_THIS_CANDIDATES=("${CANDIDATES[@]}")
 
   if ((AGENT_EVAL)) && [[ -n $agent ]]; then
     original_candidates=("${CANDIDATES[@]}")
-    candidate_list=$(printf '%s\n' "${original_candidates[@]}")
+    candidate_list=$(IFS=', '; printf '%s' "${original_candidates[*]}")
     eval_prompt=$(agent_eval_prompt "$candidate_list")
     log_step "quality review prompt sent to agent: $agent"
     printf '%s\n' "$eval_prompt" >&2
@@ -1261,14 +1440,14 @@ cmd_suggest() {
     log_warn "--agent-eval requires an available agent; local generator output was not reviewed"
   fi
 
+  for c in "${CANDIDATES[@]}"; do
+    case " ${HISTORY_THIS_CANDIDATES[*]} " in *" $c "*) ;; *) HISTORY_THIS_CANDIDATES+=("$c") ;; esac
+  done
+  history_save_request
   if ((NO_CHECK)); then printf '%s\n' "${CANDIDATES[@]}"; return 0; fi
 
   TOKENS=("${CANDIDATES[@]}")
-  if ((${#MANDATORY_TLD_ARRAY[@]} > 0)); then
-    ((ONLY_SET || SHOW_ALL)) || ONLY=all
-  else
-    ((ONLY_SET || SHOW_ALL)) || ONLY=available
-  fi
+  ((ONLY_SET || SHOW_ALL)) || ONLY=all
   log_time "checking ${#CANDIDATES[@]} names across ${#TLD_ARRAY[@]} TLD(s) (${#CANDIDATES[@]} × ${#TLD_ARRAY[@]} = $((${#CANDIDATES[@]} * ${#TLD_ARRAY[@]})) checks)"
   run_and_present
 }
@@ -1279,6 +1458,7 @@ cmd_suggest() {
 run_and_present() {
   build_domain_list
   run_pipeline
+  if [[ $MODE == suggest ]]; then history_save_checks; fi
   if [[ $MODE == batch && -z $OUT_FILE && $NO_SAVE -eq 0 && $OUT_TTY -eq 1 && $FORMAT == auto ]]; then
     mkdir -p "$OUTPUT_DIR" 2>/dev/null || die "cannot create $OUTPUT_DIR"
     printf -v OUT_FILE '%s/domain-avail-%(%Y%m%dT%H%M%S)T.csv' "$OUTPUT_DIR" -1
