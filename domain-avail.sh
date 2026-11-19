@@ -60,7 +60,7 @@ declare -l AGENT="${DOMAIN_AVAIL_AGENT:-auto}" LANG_HINT="en" STYLE="brandable"
 declare -- INPUT_FILE="" OUT_FILE="" TLDS_RAW="${DOMAIN_AVAIL_TLDS:-com,ma}"
 declare -i TLDS_SET=0
 [[ -n ${DOMAIN_AVAIL_TLDS+x} ]] && TLDS_SET=1
-declare -- AGENT_CMD="" CONTEXT_TEXT=""
+declare -- MANDATORY_TLD_RAW="" AGENT_CMD="" CONTEXT_TEXT="" PROMPT_EXTRA=""
 declare -- OUTPUT_DIR="${OUTPUT_DIR:-${SCRIPT_DIR}/output}"
 declare -- CACHE_DIR="${DOMAIN_AVAIL_CACHE_DIR:-${XDG_CACHE_HOME:-${HOME:-${TMPDIR:-/tmp}}/.cache}/domain-avail}"
 declare -- DELAY="0.5"                      # decimal string (seconds)
@@ -78,7 +78,7 @@ declare -i OUT_TTY=0 ERR_TTY=0 IN_TTY=0
 [[ -t 2 ]] && ERR_TTY=1
 [[ -t 0 ]] && IN_TTY=1
 
-declare -a POSITIONAL=() TOKENS=() DOMAINS=() TLD_ARRAY=() ROWS_ALL=() ROWS=() KEYWORDS=() CANDIDATES=()
+declare -a POSITIONAL=() TOKENS=() DOMAINS=() TLD_ARRAY=() MANDATORY_TLD_ARRAY=() ROWS_ALL=() ROWS=() KEYWORDS=() CANDIDATES=()
 declare -A SGR_OUT=() SGR_ERR=()
 declare -A TLD_CHAIN=()                     # root TLD -> "rdap:URL whois:HOST dns"
 declare -A RDAP_SERVER=() WHOIS_SERVER=()   # user overrides (root TLD -> value)
@@ -233,7 +233,8 @@ ${b}${c}USAGE${r}
 
 ${b}${c}INPUT${r}
   ${g}-f, --file FILE${r}        read names/domains from FILE ('-' = stdin); commas/spaces/newlines split
-  ${g}    --tlds LIST${r}        TLDs applied to bare names, e.g. com,ma,fr,rs,co.uk   (default: ${TLDS_RAW})
+  ${g}    --tlds LIST${r}        TLDs to check, e.g. com,ma,fr,rs,co.uk (suggest requires an explicit list)
+  ${g}    --mandatory-tld LIST${r} require suggestions AVAILABLE on every listed TLD; if --tlds is omitted, this list is checked
 
 ${b}${c}OUTPUT${r}
   ${g}-F, --format FMT${r}       table | csv | tsv | json | jsonl | bool | names   (default: table on TTY, csv otherwise;
@@ -262,11 +263,12 @@ ${b}${c}SUGGEST${r}
   An explicit TLD list is required (e.g. --tld=com,ma).
   ${g}    --agent NAME${r}       auto | none | claude | codex | opencode | grok | gemini   (default: auto)
   ${g}    --agent-cmd CMD${r}    custom command; prompt on stdin, names on stdout (run via bash -c)
-  ${g}-n, --count N${r}          number of candidates (default ${COUNT})
+  ${g}-n, --count N${r}          request N candidate names (default ${COUNT}); checks = N × number of TLDs
   ${g}    --style S${r}          brandable | short | descriptive | playful | ...  (free text for agents)
   ${g}    --single-word${r}      require one coined word; no joined keywords or phrases
   ${g}    --lang CODE${r}        fr | en | ...  (language/affix hint)
   ${g}    --context TEXT${r}     describe project/industry (alias: --industry)
+  ${g}    --prompt-extra TEXT${r} add a custom instruction to the agent prompt
   ${g}    --all${r}              show unavailable candidates too (default: available only)
   ${g}    --no-check${r}         print candidate names without checking domains
   ${g}    --print-prompt${r}     print the agent prompt and exit
@@ -322,6 +324,7 @@ parse_args() {
       -o|--output)    need_arg "$@"; OUT_FILE=$2; shift 2 ;;
       -F|--format)    need_arg "$@"; FORMAT=$2; shift 2 ;;
       --tld|--tlds)   need_arg "$@"; TLDS_RAW=$2; TLDS_SET=1; shift 2 ;;
+      --mandatory-tld|--mandatory-tlds) need_arg "$@"; [[ -n $2 ]] || die "--mandatory-tld cannot be empty"; MANDATORY_TLD_RAW=$2; shift 2 ;;
       --method)       need_arg "$@"; METHOD=$2; shift 2 ;;
       --color)        need_arg "$@"; COLOR_MODE=$2; shift 2 ;;
       --only)         need_arg "$@"; ONLY=$2; ONLY_SET=1; shift 2 ;;
@@ -341,6 +344,7 @@ parse_args() {
       --single-word)  SINGLE_WORD=1; shift ;;
       --lang)         need_arg "$@"; LANG_HINT=$2; shift 2 ;;
       --context|--industry) need_arg "$@"; CONTEXT_TEXT=$2; shift 2 ;;
+      --prompt-extra) need_arg "$@"; PROMPT_EXTRA=$2; shift 2 ;;
       -b|--boolean)   FORMAT=bool; shift ;;
       -a|--available) ONLY=available; ONLY_SET=1; shift ;;
       --all)          SHOW_ALL=1; shift ;;
@@ -380,7 +384,25 @@ validate_options() {
   case $COLOR_MODE in auto|always|never) ;; *) die "invalid --color: $COLOR_MODE" ;; esac
   case $ONLY    in all|available|taken|unknown) ;; *) die "invalid --only: $ONLY" ;; esac
   ((SHOW_ALL)) && ONLY=all
+  if [[ -n $MANDATORY_TLD_RAW && $TLDS_SET -eq 0 ]]; then
+    TLDS_RAW=$MANDATORY_TLD_RAW
+    TLDS_SET=1
+  fi
   normalize_tlds
+  MANDATORY_TLD_ARRAY=()
+  if [[ -n $MANDATORY_TLD_RAW ]]; then
+    local item t check_tld found
+    local -a items
+    IFS=', ' read -r -a items <<< "$MANDATORY_TLD_RAW"
+    for item in "${items[@]}"; do
+      t=${item,,}; t=${t#.}
+      [[ $t =~ ^[a-z0-9-]+(\.[a-z0-9-]+)*$ ]] || die "invalid mandatory TLD: $item"
+      found=0
+      for check_tld in "${TLD_ARRAY[@]}"; do [[ $check_tld == "$t" ]] && found=1; done
+      ((found)) || die "mandatory TLD .$t must also be included in --tlds"
+      case " ${MANDATORY_TLD_ARRAY[*]} " in *" $t "*) ;; *) MANDATORY_TLD_ARRAY+=("$t") ;; esac
+    done
+  fi
 }
 
 normalize_tlds() {
@@ -814,9 +836,30 @@ count_rows() {
 }
 
 filter_rows() {
-  local row
+  local row d n t st req
+  local -A required_names=()
+  if ((${#MANDATORY_TLD_ARRAY[@]} > 0)); then
+    local -A seen_tlds=() available_tlds=()
+    for row in "${ROWS_ALL[@]}"; do
+      IFS=$SEP read -r d n t st _ <<< "$row"
+      for req in "${MANDATORY_TLD_ARRAY[@]}"; do
+        [[ $t == "$req" ]] || continue
+        seen_tlds[$n]=$((${seen_tlds[$n]:-0} + 1))
+        [[ $st == AVAILABLE ]] && available_tlds[$n]=$((${available_tlds[$n]:-0} + 1))
+      done
+    done
+    for n in "${!seen_tlds[@]}"; do
+      if ((${seen_tlds[$n]} == ${#MANDATORY_TLD_ARRAY[@]} && ${available_tlds[$n]:-0} == ${#MANDATORY_TLD_ARRAY[@]})); then
+        required_names[$n]=1
+      fi
+    done
+  fi
   ROWS=()
   for row in "${ROWS_ALL[@]}"; do
+    if ((${#MANDATORY_TLD_ARRAY[@]} > 0)); then
+      IFS=$SEP read -r d n _ <<< "$row"
+      [[ -n ${required_names[$n]+x} ]] || continue
+    fi
     row_status "$row"
     case $ONLY in
       all) ;;
@@ -1062,6 +1105,8 @@ ${CONTEXT_TEXT:+Industry / project context: ${CONTEXT_TEXT}
 The industry is the primary constraint. Generate names from vocabulary, materials, craft, symbols, and customer expectations associated with this industry. Use the core keyword only if it naturally fits the industry. Do not make simple spelling variants of it or append decorative suffixes.
 }Style: ${STYLE}
 Language/culture hint: ${LANG_HINT}
+${PROMPT_EXTRA:+Additional instruction from the user: ${PROMPT_EXTRA}
+}
 
 Rules:
 - Output ONLY the names, one per line. No numbering, no bullets, no explanations, no TLD.
@@ -1147,10 +1192,15 @@ cmd_suggest() {
   fi
   ((${#CANDIDATES[@]} > 0)) || die "could not generate any candidate"
 
-  if ((!SUGGEST_CHECK || NO_CHECK)); then printf '%s\n' "${CANDIDATES[@]}"; return 0; fi
+  if ((NO_CHECK)); then printf '%s\n' "${CANDIDATES[@]}"; return 0; fi
 
   TOKENS=("${CANDIDATES[@]}")
-  ((ONLY_SET || SHOW_ALL)) || ONLY=available
+  if ((${#MANDATORY_TLD_ARRAY[@]} > 0)); then
+    ((ONLY_SET || SHOW_ALL)) || ONLY=all
+  else
+    ((ONLY_SET || SHOW_ALL)) || ONLY=available
+  fi
+  log_info "checking ${#CANDIDATES[@]} names across ${#TLD_ARRAY[@]} TLD(s) (${#CANDIDATES[@]} × ${#TLD_ARRAY[@]} = $((${#CANDIDATES[@]} * ${#TLD_ARRAY[@]})) checks)"
   run_and_present
 }
 
