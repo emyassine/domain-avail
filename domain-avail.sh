@@ -245,7 +245,7 @@ check_table_border() {
   printf '%*s' 10 '' | tr ' ' '-'
   printf '%s' '-+-'
   printf '%*s' 54 '' | tr ' ' '-'
-  printf '-+\n'
+  printf '%s\n' '-+'
 }
 
 check_table_row() { # domain, status, detail
