@@ -1125,7 +1125,7 @@ term_width() {
 }
 
 render_table() {
-  local row d n t st me cr ex rg de ca ck duration i
+  local row d n t st me cr ex rg de ca ck duration i display_len
   local -a A_d=() A_st=() A_me=() A_cr=() A_ex=() A_in=() A_dur=()
   local -i wd=6 wi tw
   for row in "${ROWS[@]}"; do
@@ -1133,7 +1133,8 @@ render_table() {
     [[ -n $rg ]] && de="registrar=$rg${de:+; $de}"
     ((ck == 1)) && me="$me*"
     A_d+=("$d"); A_st+=("$st"); A_me+=("${me:--}"); A_cr+=("${cr:--}"); A_ex+=("${ex:--}"); A_in+=("$de"); A_dur+=("${duration}s")
-    display_width "$d"; (REPLY > wd) && wd=$REPLY
+    display_len=$(display_width "$d")
+    ((display_len > wd)) && wd=$display_len
   done
   tw=$(term_width)
   wi=$((tw - wd - 65)); ((wi < 20)) && wi=20
@@ -1176,9 +1177,9 @@ render_suggest_matrix() {
     if ((WITH_MEANING)); then
       meaning=${CANDIDATE_MEANING[$n]:--}
       descriptions[$n]=$meaning
-      display_width "$meaning"
-      ((REPLY > 48)) && REPLY=48
-      ((REPLY > meaning_width)) && meaning_width=$REPLY
+      w=$(display_width "$meaning")
+      ((w > 48)) && w=48
+      ((w > meaning_width)) && meaning_width=w
     fi
     key="$n$SEP$t"
     values[$key]="$st (${duration}s)"
