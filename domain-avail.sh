@@ -69,7 +69,7 @@ declare -i TTL=604800 TTL_AVAILABLE=3600
 declare -i COUNT=20 AGENT_TIMEOUT=120
 declare -i VERBOSITY=1                      # 0 quiet · 1 normal · 2 verbose · 3 debug
 declare -i REFRESH=0 NO_CACHE=0 NO_HEADER=0 NO_CHECK=0 NO_SAVE=0
-declare -i SHOW_ALL=0 ONLY_SET=0 EXIT_STATUS=0 PRINT_PROMPT=0
+declare -i SHOW_ALL=0 ONLY_SET=0 EXIT_STATUS=0 PRINT_PROMPT=0 SINGLE_WORD=0
 declare -i TOTAL=0 N_AVAIL=0 N_TAKEN=0 N_UNKNOWN=0
 declare -i OUT_TTY=0 ERR_TTY=0 IN_TTY=0
 [[ -t 1 ]] && OUT_TTY=1
@@ -258,8 +258,9 @@ ${b}${c}SUGGEST${r}
   ${g}    --agent-cmd CMD${r}    custom command; prompt on stdin, names on stdout (run via bash -c)
   ${g}-n, --count N${r}          number of candidates (default ${COUNT})
   ${g}    --style S${r}          brandable | short | descriptive | playful | ...  (free text for agents)
+  ${g}    --single-word${r}      require one coined word; no joined keywords or phrases
   ${g}    --lang CODE${r}        fr | en | ...  (language/affix hint)
-  ${g}    --context TEXT${r}     describe the project to the agent
+  ${g}    --context TEXT${r}     describe project/industry (alias: --industry)
   ${g}    --all${r}              show unavailable candidates too (default: available only)
   ${g}    --no-check${r}         print candidate names without checking domains
   ${g}    --print-prompt${r}     print the agent prompt and exit
@@ -331,8 +332,9 @@ parse_args() {
       --agent-cmd)    need_arg "$@"; AGENT_CMD=$2; shift 2 ;;
       --agent-timeout) need_arg "$@"; is_posint "$2" || die "--agent-timeout must be a positive integer"; AGENT_TIMEOUT=$2; shift 2 ;;
       --style)        need_arg "$@"; STYLE=$2; shift 2 ;;
+      --single-word)  SINGLE_WORD=1; shift ;;
       --lang)         need_arg "$@"; LANG_HINT=$2; shift 2 ;;
-      --context)      need_arg "$@"; CONTEXT_TEXT=$2; shift 2 ;;
+      --context|--industry) need_arg "$@"; CONTEXT_TEXT=$2; shift 2 ;;
       -b|--boolean)   FORMAT=bool; shift ;;
       -a|--available) ONLY=available; ONLY_SET=1; shift ;;
       --all)          SHOW_ALL=1; shift ;;
@@ -483,7 +485,8 @@ whois_raw() { # host query -> raw response on stdout
 }
 
 whois_host_for() {
-  local tld=$1 f="$CACHE_DIR/whois-servers/$tld" now mt host=''
+  local tld=$1 now mt host=''
+  local f="$CACHE_DIR/whois-servers/$tld"
   if [[ -n ${WHOIS_SERVER[$tld]+x} ]]; then printf '%s' "${WHOIS_SERVER[$tld]}"; return 0; fi
   printf -v now '%(%s)T' -1
   if [[ -s $f ]] && ((!REFRESH)); then
@@ -1010,6 +1013,10 @@ suggest_local() {
   local -i m=0
   for k in "${KEYWORDS[@]}"; do slugify "$k"; [[ -n $REPLY ]] && kws+=("$REPLY"); done
   ((${#kws[@]} > 0)) || return 0
+  if ((SINGLE_WORD)); then
+    for k in "${kws[@]}"; do add_candidate "$k"; done
+    return 0
+  fi
   case $LANG_HINT in
     fr*) pre=(le la mon ma mes un) ; suf=(ia pro web lab hub club maison atelier ly) ;;
     es*) pre=(el la mi mis un)     ; suf=(ia pro web lab hub club casa ly) ;;
@@ -1042,8 +1049,9 @@ agent_prompt() {
   local kw="${KEYWORDS[*]}"
   cat <<EOF
 You are a naming expert. Suggest ${COUNT} domain-friendly brand names for this project.
-Keywords: ${kw}
-${CONTEXT_TEXT:+Project description: ${CONTEXT_TEXT}
+Core keyword(s) to preserve or evoke: ${kw}
+${CONTEXT_TEXT:+Industry / project context: ${CONTEXT_TEXT}
+Treat this context as a strict naming constraint: every suggestion must fit this industry and audience. Do not drift into unrelated meanings of the core keyword.
 }Style: ${STYLE}
 Language/culture hint: ${LANG_HINT}
 
@@ -1052,6 +1060,15 @@ Rules:
 - Lowercase ASCII letters, digits and hyphens only; 3 to 15 characters; easy to pronounce and spell.
 - Avoid existing well-known brands and trademarks.
 EOF
+  if ((SINGLE_WORD)); then
+    cat <<'EOF'
+- Each suggestion must be exactly one coined word, with no spaces, hyphens, or joining of two recognizable words.
+- Create a fresh, pronounceable word inspired by the core keyword and industry context.
+EOF
+  fi
+  if [[ -n $CONTEXT_TEXT ]]; then
+    printf '%s\n' "- Make the names feel appropriate for: ${CONTEXT_TEXT}."
+  fi
 }
 
 detect_agent() { # -> REPLY (agent name or empty)
