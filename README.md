@@ -63,7 +63,7 @@ script. Use `-o FILE` only when you need a specific path.
 | Mode | Trigger | Output |
 |------|---------|--------|
 | `check` | `check` subcommand, `-b`, or one domain argument | `true` / `false` per domain |
-| `table` | Multiple domain arguments without a subcommand | Live ASCII table with domain, status, and detail |
+| `table` | Multiple domain arguments without a subcommand | Live ASCII table with domain, status, creation date, expiry date, and detail |
 | `batch` | `batch` subcommand, bare names, `-f`, or stdin | CSV rows + summary |
 | `menu` | no arguments in a TTY | interactive menu |
 
@@ -131,7 +131,10 @@ done < domains.txt
 
 ## Output statuses
 
-`AVAILABLE`, `REGISTERED`, `RESERVED`, `UNKNOWN`.
+`AVAILABLE`, `REGISTERED`, `RESERVED`, `UNKNOWN`. For registered domains, the
+table and CSV detail include creation and expiry dates when the registry
+publishes them (`registration` and `expiration` events in RDAP, or matching
+date fields in WHOIS).
 
 ## Caveats
 

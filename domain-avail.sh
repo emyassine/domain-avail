@@ -240,26 +240,44 @@ trap 'rm -f "$TMP_NAMES" "$TMP_ROWS" "$TMP_CHECK_ROWS" "$TMP_PROBE" "$TMP_NAMES.
 now_utc() { date -u +"%Y-%m-%dT%H:%M:%SZ"; }
 
 check_table_border() {
+  printf '%s' "$DIM"
   printf '+-'
   printf '%*s' "$CHECK_DOMAIN_WIDTH" '' | tr ' ' '-'
   printf '%s' '-+-'
   printf '%*s' 10 '' | tr ' ' '-'
   printf '%s' '-+-'
-  printf '%*s' 54 '' | tr ' ' '-'
-  printf '%s\n' '-+'
+  printf '%*s' 10 '' | tr ' ' '-'
+  printf '%s' '-+-'
+  printf '%*s' 10 '' | tr ' ' '-'
+  printf '%s' '-+-'
+  printf '%*s' 40 '' | tr ' ' '-'
+  printf '%s%s\n' '-+' "$RESET"
 }
 
-check_table_row() { # domain, status, detail
-  local domain="$1" status="$2" detail="$3"
-  [ "${#detail}" -le 54 ] || detail="${detail:0:51}..."
-  printf '| %-*s | %-10s | %-54s |\n' \
-    "$CHECK_DOMAIN_WIDTH" "$domain" "$status" "$detail"
+check_table_row() { # domain, status, detail (including optional created/expires dates)
+  local domain="$1" status="$2" detail="$3" status_color created="-" expires="-" clean_detail
+  if [[ "$detail" =~ (^|; )created=([^; ]+) ]]; then created="${BASH_REMATCH[2]}"; fi
+  if [[ "$detail" =~ (^|; )expires=([^; ]+) ]]; then expires="${BASH_REMATCH[2]}"; fi
+  clean_detail=$(printf '%s' "$detail" | sed -E 's/;? created=[^; ]+//g; s/;? expires=[^; ]+//g; s/; *$//')
+  [ "${#clean_detail}" -le 40 ] || clean_detail="${clean_detail:0:37}..."
+  case "$status" in
+    AVAILABLE)  status_color="$GREEN" ;;
+    REGISTERED|INVALID) status_color="$RED" ;;
+    RESERVED)   status_color="$YELLOW" ;;
+    *)          status_color="$DIM" ;;
+  esac
+  printf '| %-*s | %s%-10s%s | %-10s | %-10s | %-40s |\n' \
+    "$CHECK_DOMAIN_WIDTH" "$domain" "$status_color" "$status" "$RESET" \
+    "$created" "$expires" "$clean_detail"
 }
 
 check_table_start() {
   CHECK_DOMAIN_WIDTH=$(awk 'length($0)>m {m=length($0)} END {if(m<6)m=6; print m}' "$TMP_NAMES")
   check_table_border
-  check_table_row DOMAIN STATUS DETAIL
+  printf '%s' "$BOLD"
+  printf '| %-*s | %-10s | %-10s | %-10s | %-40s |\n' \
+    "$CHECK_DOMAIN_WIDTH" DOMAIN STATUS CREATED EXPIRES DETAIL
+  printf '%s' "$RESET"
   check_table_border
 }
 
@@ -290,11 +308,18 @@ run_probe() { # probe function, domain label
 
 cache_get() { # $1=name $2=tld -> prints status or nothing
   local f="$CACHE_DIR/${1,,}.${2,,}"
+  local value
   [ "$REFRESH" -eq 0 ] && [ -f "$f" ] || return 1
   local ts; ts=$(sed -n '1p' "$f" 2>/dev/null)
   case "$ts" in ''|*[!0-9]*) return 1 ;; esac
   [ $(( $(date +%s) - ts )) -le "$TTL" ] || return 1
-  sed -n '2p' "$f"
+  value=$(sed -n '2p' "$f")
+  case "$value" in
+    REGISTERED\|*)
+      [[ "$value" == *created=* && "$value" == *expires=* ]] || return 1
+      ;;
+  esac
+  printf '%s\n' "$value"
 }
 
 cache_put() { # $1=name $2=tld $3=status|detail
@@ -315,13 +340,20 @@ check_com() { # echoes STATUS|detail
     [ -n "$http" ] || http="000"
     case "$http" in
       200)
-        local st
+        local st created expires detail
         st=$(jq -r '(.status // []) | join(",")' "$body" 2>/dev/null)
-        rm -f "$body"
         case "$st" in
-          *reserved*) echo "RESERVED|rdap status=$st" ;;
-          *) echo "REGISTERED|rdap status=${st:-active}" ;;
+          *reserved*) rm -f "$body"; echo "RESERVED|rdap status=$st"; return ;;
         esac
+        created=$(jq -r '([.events[]? | select(.eventAction == "registration") | .eventDate][0] // "")[0:10]' "$body" 2>/dev/null)
+        expires=$(jq -r '([.events[]? | select(.eventAction == "expiration") | .eventDate][0] // "")[0:10]' "$body" 2>/dev/null)
+        created="${created:-not-listed}"
+        expires="${expires:-not-listed}"
+        detail="rdap status=${st:-active}"
+        [ -n "$created" ] && detail="$detail; created=$created"
+        [ -n "$expires" ] && detail="$detail; expires=$expires"
+        rm -f "$body"
+        echo "REGISTERED|$detail"
         return ;;
       404)
         rm -f "$body"
@@ -356,8 +388,18 @@ check_ma() { # echoes STATUS|detail
     rm -f "$raw"; echo "RESERVED|anrt whois: prohibited/reserved"; return
   fi
   if grep -qiE '^Domain Name:[[:space:]]*' "$raw"; then
-    local reg; reg=$(grep -iE '^Registrar:' "$raw" | head -1 | sed 's/^[^:]*:[[:space:]]*//')
-    rm -f "$raw"; echo "REGISTERED|anrt whois registrar=${reg:-unknown}"; return
+    local reg created expires detail
+    reg=$(grep -iE '^Registrar:' "$raw" | head -1 | sed 's/^[^:]*:[[:space:]]*//')
+    created=$(awk -F: 'tolower($1) ~ /^(creation date|created on|created|registration date)$/ {sub(/^[^:]*:[[:space:]]*/, ""); sub(/[[:space:]]+$/, ""); print; exit}' "$raw")
+    expires=$(awk -F: 'tolower($1) ~ /(expiry|expiration|expires)/ {sub(/^[^:]*:[[:space:]]*/, ""); sub(/[[:space:]]+$/, ""); print; exit}' "$raw")
+    created="${created%%[ T]*}"
+    expires="${expires%%[ T]*}"
+    created="${created:-not-listed}"
+    expires="${expires:-not-listed}"
+    detail="anrt whois registrar=${reg:-unknown}"
+    [ -n "$created" ] && detail="$detail; created=$created"
+    [ -n "$expires" ] && detail="$detail; expires=$expires"
+    rm -f "$raw"; echo "REGISTERED|$detail"; return
   fi
   if grep -qiE 'rate limit|quota|too many|try again later|temporarily' "$raw"; then
     rm -f "$raw"; echo "UNKNOWN|anrt whois rate limited"; return
