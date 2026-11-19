@@ -58,6 +58,8 @@ declare -r SCRIPT_PATH SCRIPT_DIR
 declare -l MODE="" FORMAT="auto" METHOD="auto" COLOR_MODE="auto" ONLY="all"
 declare -l AGENT="${DOMAIN_AVAIL_AGENT:-auto}" LANG_HINT="en" STYLE="brandable"
 declare -- INPUT_FILE="" OUT_FILE="" TLDS_RAW="${DOMAIN_AVAIL_TLDS:-com,ma}"
+declare -i TLDS_SET=0
+[[ -n ${DOMAIN_AVAIL_TLDS+x} ]] && TLDS_SET=1
 declare -- AGENT_CMD="" CONTEXT_TEXT=""
 declare -- OUTPUT_DIR="${OUTPUT_DIR:-${SCRIPT_DIR}/output}"
 declare -- CACHE_DIR="${DOMAIN_AVAIL_CACHE_DIR:-${XDG_CACHE_HOME:-${HOME:-${TMPDIR:-/tmp}}/.cache}/domain-avail}"
@@ -254,6 +256,7 @@ ${b}${c}ENGINE${r}
   ${g}    --refresh${r}          ignore cache and re-download IANA data      ${g}--no-cache${r}  disable cache read/write
 
 ${b}${c}SUGGEST${r}
+  Suggestions require an explicit TLD list: --tld com,ma (or --tld=com,ma).
   ${g}    --agent NAME${r}       auto | none | claude | codex | opencode | grok | gemini   (default: auto)
   ${g}    --agent-cmd CMD${r}    custom command; prompt on stdin, names on stdout (run via bash -c)
   ${g}-n, --count N${r}          number of candidates (default ${COUNT})
@@ -315,7 +318,7 @@ parse_args() {
       -f|--file|-i)   need_arg "$@"; INPUT_FILE=$2; shift 2 ;;
       -o|--output)    need_arg "$@"; OUT_FILE=$2; shift 2 ;;
       -F|--format)    need_arg "$@"; FORMAT=$2; shift 2 ;;
-      --tlds)         need_arg "$@"; TLDS_RAW=$2; shift 2 ;;
+      --tld|--tlds)   need_arg "$@"; TLDS_RAW=$2; TLDS_SET=1; shift 2 ;;
       --method)       need_arg "$@"; METHOD=$2; shift 2 ;;
       --color)        need_arg "$@"; COLOR_MODE=$2; shift 2 ;;
       --only)         need_arg "$@"; ONLY=$2; ONLY_SET=1; shift 2 ;;
@@ -989,7 +992,9 @@ final_exit_code() {
 # =============================================================================
 # Suggestions
 # =============================================================================
-slugify() { # -> REPLY (ascii lowercase [a-z0-9])
+
+# Convert text into an ASCII lowercase slug and store it in REPLY.
+slugify() {
   local s
   s=$(iconv -f UTF-8 -t ASCII//TRANSLIT 2>/dev/null <<< "$1" || printf '%s' "$1")
   s=${s,,}
@@ -1051,7 +1056,7 @@ agent_prompt() {
 You are a naming expert. Suggest ${COUNT} domain-friendly brand names for this project.
 Core keyword(s) to preserve or evoke: ${kw}
 ${CONTEXT_TEXT:+Industry / project context: ${CONTEXT_TEXT}
-Treat this context as a strict naming constraint: every suggestion must fit this industry and audience. Do not drift into unrelated meanings of the core keyword.
+The industry is the primary constraint. Generate names from vocabulary, materials, craft, symbols, and customer expectations associated with this industry. Use the core keyword only if it naturally fits the industry. Do not make simple spelling variants of it or append decorative suffixes.
 }Style: ${STYLE}
 Language/culture hint: ${LANG_HINT}
 
@@ -1063,7 +1068,7 @@ EOF
   if ((SINGLE_WORD)); then
     cat <<'EOF'
 - Each suggestion must be exactly one coined word, with no spaces, hyphens, or joining of two recognizable words.
-- Create a fresh, pronounceable word inspired by the core keyword and industry context.
+- Create a fresh, pronounceable word rooted in the industry context; the core keyword is inspiration only, not a required prefix or base.
 EOF
   fi
   if [[ -n $CONTEXT_TEXT ]]; then
@@ -1112,6 +1117,7 @@ parse_agent_names() { # stdin: agent output -> CANDIDATES
 
 cmd_suggest() {
   local agent out
+  ((TLDS_SET)) || die "suggest requires an explicit TLD list; use --tld com,ma (or --tld=com,ma)"
   KEYWORDS=("${POSITIONAL[@]}")
   if [[ -n $INPUT_FILE && $INPUT_FILE != - && -r $INPUT_FILE ]]; then
     local line; while IFS= read -r line; do ingest_line "$line"; done < "$INPUT_FILE"
