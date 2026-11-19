@@ -101,6 +101,7 @@ trim() {
 }
 
 now_utc()    { date -u +%Y-%m-%dT%H:%M:%SZ; }
+
 file_mtime() {
   local m
   m=$(stat -c %Y "$1" 2>/dev/null || stat -f %m "$1" 2>/dev/null || echo 0)
