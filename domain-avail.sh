@@ -66,12 +66,12 @@ declare -- CACHE_DIR="${DOMAIN_AVAIL_CACHE_DIR:-${XDG_CACHE_HOME:-${HOME:-${TMPD
 declare -- DELAY="0.5"                      # decimal string (seconds)
 declare -- TIMEOUT_BIN=""
 declare -- WORK=""
-declare -i TIMEOUT=15 RETRIES=2 JOBS=1
+declare -i TIMEOUT=15 RETRIES=2 JOBS=4
 declare -i TTL=604800 TTL_AVAILABLE=3600
 declare -i COUNT=20 AGENT_TIMEOUT=120
 declare -i VERBOSITY=1                      # 0 quiet · 1 normal · 2 verbose · 3 debug
 declare -i REFRESH=0 NO_CACHE=0 NO_HEADER=0 NO_CHECK=0 NO_SAVE=0
-declare -i SHOW_ALL=0 ONLY_SET=0 EXIT_STATUS=0 PRINT_PROMPT=0 SINGLE_WORD=0
+declare -i SHOW_ALL=0 ONLY_SET=0 EXIT_STATUS=0 PRINT_PROMPT=0 SINGLE_WORD=0 AGENT_EVAL=0
 declare -i TOTAL=0 N_AVAIL=0 N_TAKEN=0 N_UNKNOWN=0
 declare -i OUT_TTY=0 ERR_TTY=0 IN_TTY=0
 [[ -t 1 ]] && OUT_TTY=1
@@ -199,15 +199,22 @@ hline() { # hline width -> REPLY (dashes)
 log_err()   { printf '%s %s\n' "$(paint ERR bold+red '[ERROR]')" "$*" >&2; }
 log_warn()  { ((VERBOSITY >= 1)) && printf '%s %s\n' "$(paint ERR bold+yellow '[WARN]')" "$*" >&2; return 0; }
 log_info()  { ((VERBOSITY >= 2)) && printf '%s %s\n' "$(paint ERR bold+cyan '[INFO]')" "$*" >&2; return 0; }
+log_time()  { ((VERBOSITY >= 1)) && printf '%s %s\n' "$(paint ERR bold+cyan '[TIME]')" "$*" >&2; return 0; }
 log_debug() { ((VERBOSITY >= 3)) && printf '%s %s\n' "$(paint ERR gray '[DBG]')" "$*" >&2; return 0; }
 log_ok()    { ((VERBOSITY >= 1)) && printf '%s %s\n' "$(paint ERR bold+green '[OK]')" "$*" >&2; return 0; }
 log_step()  { ((VERBOSITY >= 1)) && printf '\n%s %s\n' "$(paint ERR bold+blue '==>')" "$(paint ERR bold "$*")" >&2; return 0; }
 die()       { log_err "$*"; exit "$EX_USAGE"; }
 
-progress() { # idx domain status
+progress_start() { # idx domain
   if ((VERBOSITY >= 2 || (VERBOSITY == 1 && ERR_TTY))); then
-    printf '  %s %s %s\n' "$(paint ERR dim "[$1/$TOTAL]")" "$2" \
-      "$(paint ERR "$(status_style "$3")" "$3")" >&2
+    printf '  %s checking %s...\n' "$(paint ERR dim "[$1/$TOTAL]")" "$2" >&2
+  fi
+}
+
+progress() { # idx domain status elapsed_seconds
+  if ((VERBOSITY >= 2 || (VERBOSITY == 1 && ERR_TTY))); then
+    printf '  %s %s %s (%ss)\n' "$(paint ERR dim "[$1/$TOTAL]")" "$2" \
+      "$(paint ERR "$(status_style "$3")" "$3")" "$4" >&2
   fi
 }
 
@@ -247,7 +254,7 @@ ${b}${c}OUTPUT${r}
 
 ${b}${c}ENGINE${r}
   ${g}    --method M${r}         auto | rdap | whois | dns  (auto = fallback chain)
-  ${g}-j, --jobs N${r}           parallel checks (default 1; per-TLD delays are not enforced across jobs)
+  ${g}-j, --jobs N${r}           parallel checks (default ${JOBS}; per-TLD delays are not enforced across jobs)
   ${g}    --delay SEC${r}        politeness delay after each network check (default ${DELAY})
   ${g}    --delay-tld T=SEC${r}  per-TLD delay (repeatable), e.g. --delay-tld ma=2
   ${g}    --timeout SEC${r}      network timeout (default ${TIMEOUT})
@@ -269,6 +276,7 @@ ${b}${c}SUGGEST${r}
   ${g}    --lang CODE${r}        fr | en | ...  (language/affix hint)
   ${g}    --context TEXT${r}     describe project/industry (alias: --industry)
   ${g}    --prompt-extra TEXT${r} add a custom instruction to the agent prompt
+  ${g}    --agent-eval${r}       ask the same agent to review and improve its candidate list
   ${g}    --all${r}              show unavailable candidates too (default: available only)
   ${g}    --no-check${r}         print candidate names without checking domains
   ${g}    --print-prompt${r}     print the agent prompt and exit
@@ -345,6 +353,7 @@ parse_args() {
       --lang)         need_arg "$@"; LANG_HINT=$2; shift 2 ;;
       --context|--industry) need_arg "$@"; CONTEXT_TEXT=$2; shift 2 ;;
       --prompt-extra) need_arg "$@"; PROMPT_EXTRA=$2; shift 2 ;;
+      --agent-eval|--with-agent-eval) AGENT_EVAL=1; shift ;;
       -b|--boolean)   FORMAT=bool; shift ;;
       -a|--available) ONLY=available; ONLY_SET=1; shift ;;
       --all)          SHOW_ALL=1; shift ;;
@@ -379,6 +388,7 @@ parse_args() {
 }
 
 validate_options() {
+  [[ -z $MANDATORY_TLD_RAW || $MODE == suggest ]] || die "--mandatory-tld is only valid with suggest"
   case $FORMAT  in auto|table|csv|tsv|json|jsonl|bool|names) ;; *) die "invalid --format: $FORMAT" ;; esac
   case $METHOD  in auto|rdap|whois|dns) ;; *) die "invalid --method: $METHOD" ;; esac
   case $COLOR_MODE in auto|always|never) ;; *) die "invalid --color: $COLOR_MODE" ;; esac
@@ -745,11 +755,12 @@ build_domain_list() {
 # Core check
 # =============================================================================
 check_one() { # idx domain -> writes $WORK/res.idx
-  local -i idx=$1 cached=0
+  local -i idx=$1 cached=0 started=$SECONDS elapsed
   local domain=$2
   local name=${domain%%.*} tld=${domain#*.} root=${domain##*.}
   local rec='' st='' me='' cr='' ex='' rg='' de='' step kind arg res notes='' ts dl
   ts=$(now_utc)
+  progress_start "$idx" "$domain"
 
   if ((${#domain} > 253)) || [[ ! $domain =~ $RE_DOMAIN ]]; then
     rec=$(emit INVALID syntax '' '' '' 'invalid domain syntax')
@@ -785,16 +796,26 @@ check_one() { # idx domain -> writes $WORK/res.idx
 
   IFS=$SEP read -r st me cr ex rg de <<< "$rec"
   emit "$domain" "$name" "$tld" "$st" "$me" "$cr" "$ex" "$rg" "$de" "$ts" "$cached" > "$WORK/res.$idx"
-  progress "$idx" "$domain" "$st"
+  elapsed=$((SECONDS - started))
+  progress "$idx" "$domain" "$st" "$elapsed"
 }
 
 run_pipeline() {
   ((${#DOMAINS[@]} > 0)) || die "no domains supplied"
   local d row line
-  local -i i=0 running=0
+  local -i i=0 running=0 total_start=$SECONDS phase_start data_elapsed backend_elapsed checks_start
   TOTAL=${#DOMAINS[@]}
+  phase_start=$SECONDS
+  log_step "loading IANA data"
   ensure_data
+  data_elapsed=$((SECONDS - phase_start))
+  log_time "IANA data ready in ${data_elapsed}s"
+  phase_start=$SECONDS
+  log_step "discovering RDAP/WHOIS backends"
   prepare_backends
+  backend_elapsed=$((SECONDS - phase_start))
+  checks_start=$SECONDS
+  log_time "backends ready in ${backend_elapsed}s; checking $TOTAL domains with $JOBS parallel jobs"
 
   for d in "${DOMAINS[@]}"; do
     i+=1
@@ -818,6 +839,7 @@ run_pipeline() {
     fi
   done
   count_rows
+  log_time "IANA data ${data_elapsed}s; server discovery ${backend_elapsed}s; checks $((SECONDS - checks_start))s with $JOBS parallel jobs; total $((SECONDS - total_start))s"
 }
 
 row_status() { local _a _b _c; IFS=$SEP read -r _a _b _c REPLY _ <<< "$1"; }
@@ -1124,6 +1146,27 @@ EOF
   fi
 }
 
+agent_eval_prompt() {
+  local candidate_list=$1 single_word_constraint=''
+  ((SINGLE_WORD)) && single_word_constraint='Every result must be one coined word: no spaces, hyphens, or joining recognizable words.'
+  cat <<EOF
+You are a demanding brand naming director. Review and improve the candidate list below.
+Core keyword(s): ${KEYWORDS[*]}
+Industry / project context: ${CONTEXT_TEXT:-not specified}
+Style: ${STYLE}
+Language/culture hint: ${LANG_HINT}
+${PROMPT_EXTRA:+Additional instruction from the user: ${PROMPT_EXTRA}
+}
+Keep only names that fit the industry and sound distinctive, credible, memorable, and easy to pronounce. Reject generic names, weak suffix variations, clichés, names that merely repeat the core keyword, and names that do not fit the requested language or culture.
+${single_word_constraint:+${single_word_constraint}
+}
+Return exactly ${COUNT} final names, one per line, names only. Keep the strongest candidates and create better replacements for rejected ones. Do not explain your choices and do not include TLDs.
+
+Candidates to review:
+${candidate_list}
+EOF
+}
+
 detect_agent() { # -> REPLY (agent name or empty)
   local a
   REPLY=''
@@ -1164,7 +1207,9 @@ parse_agent_names() { # stdin: agent output -> CANDIDATES
 }
 
 cmd_suggest() {
-  local agent out prompt
+  local agent out prompt eval_prompt eval_out candidate_list
+  local -i agent_started
+  local -a original_candidates=()
   if ((!NO_CHECK && !TLDS_SET)); then
     die "suggest checks availability by default and requires an explicit TLD list; use --tld com,ma (or --tld=com,ma), or add --no-check"
   fi
@@ -1182,15 +1227,39 @@ cmd_suggest() {
     prompt=$(agent_prompt)
     log_step "prompt sent to agent: $agent"
     printf '%s\n' "$prompt" >&2
+    agent_started=$SECONDS
     out=$(run_agent "$agent" "$prompt" 2>/dev/null) || log_warn "agent '$agent' failed or timed out"
     parse_agent_names <<< "$out"
-    log_info "agent returned ${#CANDIDATES[@]} usable name(s)"
+    log_time "agent generation took $((SECONDS - agent_started))s; returned ${#CANDIDATES[@]} of $COUNT requested usable names"
   fi
   if ((${#CANDIDATES[@]} == 0)); then
     [[ -z $agent ]] || log_warn "no usable names from agent, falling back to local generator"
     suggest_local
   fi
   ((${#CANDIDATES[@]} > 0)) || die "could not generate any candidate"
+
+  if ((AGENT_EVAL)) && [[ -n $agent ]]; then
+    original_candidates=("${CANDIDATES[@]}")
+    candidate_list=$(printf '%s\n' "${original_candidates[@]}")
+    eval_prompt=$(agent_eval_prompt "$candidate_list")
+    log_step "quality review prompt sent to agent: $agent"
+    printf '%s\n' "$eval_prompt" >&2
+    agent_started=$SECONDS
+    if eval_out=$(run_agent "$agent" "$eval_prompt" 2>/dev/null); then
+      CANDIDATES=(); CAND_SEEN=()
+      parse_agent_names <<< "$eval_out"
+      if ((${#CANDIDATES[@]} == 0)); then
+        CANDIDATES=("${original_candidates[@]}")
+        log_warn "agent review returned no usable names; keeping original candidates"
+      fi
+    else
+      log_warn "agent review failed or timed out; keeping original candidates"
+      CANDIDATES=("${original_candidates[@]}")
+    fi
+    log_time "agent review took $((SECONDS - agent_started))s; final list has ${#CANDIDATES[@]} name(s)"
+  elif ((AGENT_EVAL)); then
+    log_warn "--agent-eval requires an available agent; local generator output was not reviewed"
+  fi
 
   if ((NO_CHECK)); then printf '%s\n' "${CANDIDATES[@]}"; return 0; fi
 
@@ -1200,7 +1269,7 @@ cmd_suggest() {
   else
     ((ONLY_SET || SHOW_ALL)) || ONLY=available
   fi
-  log_info "checking ${#CANDIDATES[@]} names across ${#TLD_ARRAY[@]} TLD(s) (${#CANDIDATES[@]} × ${#TLD_ARRAY[@]} = $((${#CANDIDATES[@]} * ${#TLD_ARRAY[@]})) checks)"
+  log_time "checking ${#CANDIDATES[@]} names across ${#TLD_ARRAY[@]} TLD(s) (${#CANDIDATES[@]} × ${#TLD_ARRAY[@]} = $((${#CANDIDATES[@]} * ${#TLD_ARRAY[@]})) checks)"
   run_and_present
 }
 
