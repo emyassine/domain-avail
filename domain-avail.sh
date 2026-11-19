@@ -700,7 +700,8 @@ history_save_request() {
       style:$style,language:$language,prompt_extra:$extra,single_word:($single_word == 1),with_meaning:($with_meaning == 1),
       industry_key:$industry_key,history_scope:$candidates_scope,requested_count:$count,agent:$agent,
       agent_eval:$agent_eval,tlds:$tlds,mandatory_tlds:$mandatory_tlds,candidates:$candidates,candidate_details:$candidate_details}' \
-    >> "$HISTORY_FILE" || log_warn "cannot write history: $HISTORY_FILE"
+    >> "$HISTORY_FILE" || { log_warn "cannot write history: $HISTORY_FILE"; return; }
+  history_compact
 }
 
 history_save_checks() {
@@ -714,11 +715,42 @@ history_save_checks() {
       printf '%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\n' \
         "$d" "$st" "$me" "$cr" "$ex" "$rg" "$de" "$ca" "$duration" "$epoch"
     done
-  } | jq -Rrc --arg sep $'\t' --arg request_key "${REQUEST_KEY:-}" '
+  } | jq -Rrc --arg sep $'\t' '
     split($sep) as $r | {type:"check",domain:$r[0],status:$r[1],method:$r[2],
       created:$r[3],expires:$r[4],registrar:$r[5],detail:$r[6],checked_at:$r[7],
-      duration_seconds:($r[8]|tonumber),epoch:($r[9]|tonumber),request_key:$request_key}' >> "$HISTORY_FILE" \
-      || log_warn "cannot append check results to history: $HISTORY_FILE"
+      duration_seconds:($r[8]|tonumber),epoch:($r[9]|tonumber)}' >> "$HISTORY_FILE" \
+      || { log_warn "cannot append check results to history: $HISTORY_FILE"; return; }
+  history_compact
+}
+
+history_compact() {
+  [[ -n $HISTORY_FILE && -s $HISTORY_FILE ]] || return 0
+  local compact_tmp
+  compact_tmp=$(mktemp "${HISTORY_FILE}.XXXXXX") || { log_warn "cannot compact history: temporary file creation failed"; return 1; }
+  if ! jq -sc '
+    ([.[] | select(.type == "request")]
+      | group_by(.key)
+      | map(.[-1] as $latest
+          | . as $group
+          | $latest + {
+              candidates: ([$group[].candidates[]?] | unique),
+              candidate_details: ([$group[].candidate_details[]?]
+                | reduce .[] as $detail ({}; .[$detail.name] = $detail.meaning)
+                | to_entries | map({name:.key,meaning:.value}))
+            }))
+    + ([.[] | select(.type == "check")]
+      | group_by(.domain)
+      | map(max_by(.epoch) | del(.request_key)))
+    | .[]' "$HISTORY_FILE" > "$compact_tmp"; then
+    rm -f -- "$compact_tmp"
+    log_warn "cannot compact invalid history: $HISTORY_FILE"
+    return 1
+  fi
+  if ! mv -f -- "$compact_tmp" "$HISTORY_FILE"; then
+    rm -f -- "$compact_tmp"
+    log_warn "cannot replace compacted history: $HISTORY_FILE"
+    return 1
+  fi
 }
 
 # =============================================================================
